@@ -1,13 +1,13 @@
 # Non-rigid alignment of serial sections
 
-`02_align-sequential-shared.py` registers the four sections onto `WD-76845-044`
+`align-sequential-shared_02.py` registers the four sections onto `WD-76845-044`
 and writes the warped channels.
 
 ## Environment
 
 ```bash
 pixi install
-pixi run 02_align-sequential-shared.py
+pixi run align-sequential-shared_02.py
 ```
 
 `pixi.lock` is solved for `win-64` only. To run elsewhere, add your platform to
