@@ -1,0 +1,72 @@
+---
+title: "Reorder_02"
+output: html_document
+date: "2026-07-06"
+---
+### Script for Analysis of CyCIF tonsil dataset for "Are low-variance Principal Components of single-cell omics data biologically meaningful, or just noise?" 
+### Reorders Tonsil B channels to match Tonsil A
+### inputs: dataTONSILB.csv 
+### outputs: dataTONSILB_reordered.csv
+
+### Data source. 
+#https://elifesciences.org/articles/31657#content
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+### Load tonsil B data.
+tonsilB <- read.csv("Data/dataTONSILB.csv", check.names = FALSE)
+
+
+
+### Tonsils A and B were stained with the same antibody panels but imaged in different cycle orders (see Lin et al. 2018, eLife, Figure 5). https://iiif.elifesciences.org/lax/31657%2Felife-31657-fig5-v3.tif/full/1500,/0/default.jpg
+### This remapping reassigns Tonsil B's columns so that cycle N in both Tonsils corresponds to the same antibody target.
+
+
+### Mapping from standardized cycle number to source cycle in raw Tonsil B.
+b_source_for_cycle <- c(
+  1,  2,  3,  14,
+  15, 9,  7,  13,
+  11, 10, 6,  12,
+  8,  4,  5,  16
+)
+
+### Fluorescence channels measured in each cycle. 
+channels <- c("FITC", "Cy3", "Cy5")
+
+### Function to reorder Tonsil B cycles to match the Tonsil A antibody order.
+reorder_slideB <- function(dfB, channels, b_source_for_cycle) {  
+  dfB_fixed <- dfB
+
+  for (ch in channels) {  
+    for (cyc in 1:16) { 
+      ### Destination slot in corrected data (e.g. FITC_4).
+      target_col <- paste0(ch, "_", cyc) 
+      ### Where this stain is located in raw B (e.g. FITC_14). 
+       source_col <- paste0(ch, "_", b_source_for_cycle[cyc])   
+      ### Confirm that all expected source and target columns are present. 
+      if (!(target_col %in% names(dfB))) {
+        stop(paste("Missing column in Slide B:", target_col))
+      }
+      if (!(source_col %in% names(dfB))) {
+        stop(paste("Missing column in Slide B:", source_col))
+      }
+      ### Fill the destination column with the corresponding raw Tonsil B cycle.
+      dfB_fixed[[target_col]] <- dfB[[source_col]]
+    }
+  }
+  ### Return reordered Tonsil B data.
+  dfB_fixed
+}
+### Reorder Tonsil B cycles to match the Tonsil A antibody order.
+tonsilB_fixed <- reorder_slideB(tonsilB, channels, b_source_for_cycle)
+
+
+
+### Save output reordered for downstream analysis.
+write.csv(tonsilB_fixed, "Data/dataTONSILB_reordered.csv", row.names = FALSE)
+```
+

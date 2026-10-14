@@ -1,0 +1,546 @@
+---
+title: "Seqfish_pipeline_01"
+output: html_document
+date: "2026-08-20"
+---
+
+### Script for Analysis of seqFISH mouse hippocampus dataset for "Are low-variance Principal Components of single-cell omics data biologically meaningful, or just noise?"
+### Data source:
+### Shah et al. 2016
+### https://www.cell.com/neuron/fulltext/S0896-6273(16)30702-4
+### PCA on the 214 barcoded genes; spatial correlation by nearest-neighbour rank within each field of view; exponential decay fits; predicted noise fraction per PC; Figure 2 panels
+### Inputs: mmc6.xlsx 
+### Outputs panels for figure 2. 
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+### Load libraries
+library(readxl)
+library(ggplot2)
+library(dplyr)
+library(stringr)
+library(ggrepel)
+library(cowplot)
+library("patchwork")
+library(ggnewscale)
+```
+
+
+```{r}
+### Functions
+
+### Calculate spatial correlation by nearest-neighbour rank
+### For each PC, correlate each cell's PC score with the score of its
+### 1st, 2nd, ..., kth nearest neighbour.
+### Returns a matrix with PCs as rows and neighbour ranks as columns.
+### pearson correlation computed across all cells from all fields of view pooled
+pc_correlation <- function(x_scores, y_scores_full, neighbour_pairs) {
+  num_pcs <- ncol(x_scores); k <- ncol(neighbour_pairs)
+  cor_matrix <- matrix(NA, num_pcs, k,
+    dimnames = list(colnames(x_scores), paste0("Neighbor", 1:k)))
+  for (p in 1:num_pcs) {
+    x <- x_scores[, p]
+    for (c in 1:k) {
+      y <- y_scores_full[neighbour_pairs[, c], p]
+      cor_matrix[p, c] <- cor(x, y, use = "complete.obs")
+    }
+  }
+  cor_matrix
+}
+
+### Run PCA and calculate neighbour-rank spatial correlations
+### PCA is performed after centering and scaling each gene.
+### Returns the PCA object and the spatial correlation matrix
+run_pc_spatial <- function(mat, nn_idx) {
+  pca <- prcomp(mat, center = TRUE, scale. = TRUE)
+  scores <- as.matrix(pca$x)
+  cors <- pc_correlation(scores, scores, nn_idx)
+  list(pca = pca, cor = cors)
+}
+
+### Fit exponential spatial-decay curves
+# Fit C(d) = A * exp(-d / L), where A is the correlation amplitude and L is the length scale
+
+fit_exponential_decay <- function(dist, corr) {
+  df_fit <- data.frame(d = dist, corr = as.numeric(corr)) %>%
+    filter(is.finite(corr), is.finite(d))
+  if (nrow(df_fit) < 10) return(c(A=NA, lambda=NA, A_se=NA, lambda_se=NA))
+#### Starting value for L: the distance at which the correlation is closest to 1/e of its maximum, with a minimum of 5 µm
+  corr_thresh <- max(df_fit$corr) / exp(1)
+  L_start <- df_fit$d[which.min(abs(df_fit$corr - corr_thresh))]
+  L_start <- max(L_start, 5)
+  
+  fit <- tryCatch(
+    nls(corr ~ A * exp(-d / L), data = df_fit,
+      ### Initialize A as the maximum observed correlation.  
+        start = list(A = max(df_fit$corr), L = L_start),
+        lower = c(A = -1, L = min(df_fit$d)),
+        upper = c(A = 1, L = max(df_fit$d)),
+        algorithm = "port"),
+    error = function(e) NULL)
+  
+  # fallback if first attempt fails
+  if (is.null(fit)) {
+    fit <- tryCatch(
+      nls(corr ~ A * exp(-d / L), data = df_fit,
+          start = list(A = 0.01, L = 100),
+          lower = c(A = -1, L = min(df_fit$d)),
+          upper = c(A = 1, L = max(df_fit$d)),
+          algorithm = "port"),
+      error = function(e) NULL)
+  }
+    ### return outputs
+  if (is.null(fit)) return(c(A=NA, lambda=NA, A_se=NA, lambda_se=NA))
+  sm <- summary(fit)$coefficients
+  c(A = sm["A","Estimate"], lambda = sm["L","Estimate"],
+    A_se = sm["A","Std. Error"], lambda_se = sm["L","Std. Error"])
+}
+```
+
+### SeqFISH mouse hippocampus dataset from Shah et al. 2016
+### The source file contains 249 measured genes across 21 fields of view:
+### 214 barcoded seqFISH genes followed by 35 serial smHCR genes.
+### PCA and subsequent analyses use the 214 barcoded genes.
+
+### 1. Data loading
+```{r}
+
+### load in gene counts 
+counts <- suppressMessages(read_excel("Data/mmc6.xlsx", sheet = "Hippocampus Counts", col_names = FALSE))
+
+### load in centroids of cells 
+centroids <- suppressMessages(read_excel("Data/mmc6.xlsx", sheet = "Centroids", col_names = FALSE))
+
+### Load the field-of-view (FOV) label of each cell
+field_vec <- suppressMessages(read_excel("Data/mmc6.xlsx", sheet = "Field Vector", col_names = FALSE))
+
+### Strip quote marks from the gene names (first column) and use them as row names; transpose so that rows are cells and columns are genes. Centroids are X, Y, Z in pixels
+counts <- as.data.frame(counts) %>% mutate(...1 = str_remove_all(...1, "'"))
+genenames <- counts$...1
+rownames(counts) <- genenames
+counts <- counts %>% select(-...1)
+colnames(counts) <- 1:ncol(counts)
+counts_t <- as.data.frame(t(counts))
+
+colnames(centroids) <- c("X", "Y", "Z")
+fov <- t(field_vec)
+
+##combine into one DF
+Full_DF <- cbind(counts_t, centroids, fov)
+
+markers <- counts_t
+
+### 214 barcoded by seqFISH, 35 serial smHCR (per Shah et al. 2016 methods)
+### Keep only the 214 barcoded genes for PCA, because the serial smHCR genes differ in noise and expression level
+### File lists the 214 barcoded genes first and the 35 serial genes last
+barcoded_genes <- head(colnames(markers), 214)
+
+
+```
+
+### 2. Nearest neighbours within each field of view
+```{r}
+### Take the total number of cells in the FOV with the fewest cells - 1 and set that as the number of NN to take
+### selected so every cell in each fov has the same number of neighbours and that we do not take more NN than exist
+k_nn <- min(table(Full_DF$fov)) - 1
+cat("k =", k_nn, "\n")
+
+
+#### X and Y are within FOV, add an offset so nearest neighbours are restricted to the same FOV and will not cross over to other FOVs
+Full_DF_pool <- Full_DF %>%
+  mutate(
+    X_shifted = X + as.integer(factor(fov)) * 10000,
+    Y_shifted = Y + as.integer(factor(fov)) * 10000
+  )
+
+### Run NN on the shifted coords, so each cells NN are only within FOV
+knn_pool <- RANN::nn2(
+  data  = as.matrix(Full_DF_pool[, c("X_shifted", "Y_shifted")]),
+  query = as.matrix(Full_DF_pool[, c("X_shifted", "Y_shifted")]),
+  k = k_nn + 1
+)
+###Get the index of each cell and their K NN, dropping the first NN (self)
+nn_idx <- knn_pool$nn.idx[, -1, drop = FALSE]
+
+### Mean distance to the n-th nearest neighbour, averaged over all cells (self excluded)
+mean_d <- colMeans(knn_pool$nn.dists[, -1, drop = FALSE])
+
+# Confirm no cross-FOV neighbors 
+focal_fov <- Full_DF_pool$fov
+nbr_fov   <- matrix(focal_fov[nn_idx], nrow = nrow(nn_idx), ncol = ncol(nn_idx))
+cat("Cross-FOV neighbor pairs:", sum(nbr_fov != focal_fov), "\n")
+
+
+
+### convert from pixel to um. Each field of view is 216 × 216 µm, imaged at 1024 × 1024 pixels
+
+mean_d_um <- mean_d * (216/1024)
+```
+
+### 3. PCA and spatial correlation by nearest-neighbour rank
+
+```{r}
+### apply log(1 + count) transform to markers 
+markers_log <- log1p(markers)
+
+### Perform PCA on the 214 barcoded genes and calculate spatial correlations as a function of nearest-neighbour rank
+res_barcoded <- run_pc_spatial(markers_log[, barcoded_genes], nn_idx)
+
+var_explained_barcoded = res_barcoded$pca$sdev^2 / sum(res_barcoded$pca$sdev^2)
+
+```
+
+
+
+### 4. Exponential fits to the correlation curves 
+```{r}
+### spatial correlation is expected to decay with  distance if a PC captures real tissue structure
+### Model this decay as A·exp(−d/L), where A is the amplitude and L is the length scale
+cor_br <- res_barcoded$cor
+
+#### For each PC, fit A·exp(−d/L) to its correlation versus mean neighbour distance (µm)
+fit_params <- as.data.frame(t(sapply(rownames(cor_br), function(pc) {
+  fit_exponential_decay(mean_d_um, cor_br[pc, ])
+})))
+
+fit_params$PC <- seq_len(nrow(fit_params))
+
+```
+
+### 5. Plot correlation curves with exponential fits (Fig 2. C)
+```{r}
+
+pcs_to_show <- c("PC1", "PC5", "PC10", "PC20", "PC50", "PC100")
+
+### Observed correlation versus mean neighbour distance for the PCs shown
+decay_df <- bind_rows(lapply(pcs_to_show, function(pc) {
+  data.frame(
+    PC     = pc,
+    PC_num = as.numeric(sub("PC", "", pc)),
+    dist   = mean_d_um,
+    cor    = as.numeric(cor_br[pc, ])
+  )
+}))
+
+### Fitted curve A·exp(−d/L) for each PC shown, evaluated at 200 evenly spaced distances
+fit_df <- bind_rows(lapply(pcs_to_show, function(pc) {
+  co <- fit_exponential_decay(mean_d_um, cor_br[pc, ])
+  if (!all(is.finite(co))) return(NULL)
+  d_seq <- seq(min(mean_d_um), max(mean_d_um), length.out = 200)
+  data.frame(
+    PC     = pc,
+    PC_num = as.numeric(sub("PC", "", pc)),
+    dist   = d_seq,
+    cor    = co["A"] * exp(-d_seq / co["lambda"])
+  )
+}))
+
+
+
+
+p <- ggplot(decay_df, aes(x = dist, y = cor, group = PC, colour = PC_num)) +
+  geom_line(linewidth = 1, alpha = 0.45) +
+  scale_colour_viridis_c(
+    name   = "PC #",
+    trans  = "log10",
+    breaks = as.numeric(sub("PC", "", pcs_to_show))
+  ) +
+  new_scale_colour() +
+  geom_line(
+    data = fit_df,
+    aes(x = dist, y = cor, group = PC, colour = "Exponential fit"),
+    linetype = "dashed", linewidth = 0.6, alpha = 0.35
+  ) +
+  scale_colour_manual(name = NULL, values = c("Exponential fit" = "red")) +
+  geom_hline(yintercept = 0, linetype = "dotted", colour = "grey50") +
+  theme_minimal(base_size = 10) +
+  labs(x = "Mean distance (µm)", y = "Correlation") +
+   theme(
+    panel.grid.minor = element_line(color = "gray90", linetype = "solid",linewidth = 0.12),
+    panel.grid.major = element_line(color = "gray80", linetype = "solid",linewidth = 0.23)
+  ) 
+print(p) 
+
+
+seqfish_curve_legend <- get_legend(p)
+seqfish_curve_no_legend <- p + theme(legend.position = "none")
+ggsave("Data/Fig_seqfish_curve_legend.svg", plot = seqfish_curve_legend,
+       width = 1, height = 3, units = "in",
+       dpi = 300) 
+
+ggsave("Data/Fig_seqfish_curve.svg", plot = seqfish_curve_no_legend,
+       width = 3, height = 2, units = "in",
+       dpi = 300)
+
+```
+
+
+
+
+
+### 6. Plot fitted spatial-decay parameters (Fig 2. D)
+```{r}
+
+fit_plot_all <- fit_params %>%
+  filter(!is.na(A), !is.na(lambda))
+
+
+
+### add labels to pcs up to 15
+fit_plot_all <- fit_plot_all %>% 
+  mutate(under_15 = ifelse(PC <= 15,paste0("PC",PC),""))
+
+### make plot of parameters 
+
+seqfish_param<- ggplot(fit_plot_all, aes(x = lambda, y = A, color = PC)) +
+  geom_point(size = 1.5) +
+  scale_colour_viridis_c(
+    name = "PC #",
+    trans = "log10",
+    breaks = c(1, 5, 10, 20, 50, 100, 200)
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  theme_minimal(base_size = 10) +
+  labs(
+    x = expression("L (µm)"),
+    y = expression(A),
+  ) +
+   geom_text_repel(aes(label = under_15)) +
+   theme(
+    panel.grid.minor = element_line(color = "gray90", linetype = "solid",linewidth = 0.12),
+    panel.grid.major = element_line(color = "gray80", linetype = "solid",linewidth = 0.23)
+  ) 
+
+print(seqfish_param)
+
+parm_legend <- get_legend(seqfish_param)
+
+
+seqfish_param_no_legend <- seqfish_param + theme(legend.position = "none")
+
+
+
+ggsave("Data/Fig_seqfish_param_legend.svg", plot = parm_legend,
+       width = 2, height = 3, units = "in",
+       dpi = 300)  
+
+ggsave("Data/Fig_seqfish_param.svg", plot = seqfish_param_no_legend,
+       width = 3, height = 2, units = "in",
+       dpi = 300)  
+
+```
+
+
+
+
+### 7. Predicted noise fraction per PC (Fig 2. A)
+
+```{r}
+
+### get the PCA object
+pca_br <- res_barcoded$pca 
+### Assumed values of r, the correlation between a gene's measured and true expression: 0.20 to 0.80 in steps of 0.05.
+r_vals <- round(seq(0.2, 0.8, by = 0.05), 2)
+
+### squared loadings: the weight of each gene's noise variance in each PC
+loadings_sq <- pca_br$rotation^2
+### Total variance of each PC
+pc_total    <- pca_br$sdev^2
+### Number of genes in the PCA
+n_genes     <- nrow(pca_br$rotation)
+
+###  Propagate gene-level noise variance into PC-level noise variance
+### Genes are scaled to unit variance, so a gene measured with correlation r to its true expression has noise variance 1 − r²
+noise_df <- purrr::map_dfr(r_vals, function(r_i) {
+  gene_noise <- rep(1 - r_i^2, n_genes)
+  ### Assumes measurement noise is independent across genes, so noise variances add through the squared loadings.
+  pc_noise   <- colSums(loadings_sq * gene_noise)
+  ### Noise fraction = predicted PC noise variance / total PC variance, with the same r assumed for every gene
+  data.frame(PC = seq_along(pc_total), noise_fraction = pc_noise / pc_total, r = r_i)
+})
+
+
+seq_fish_noise <- ggplot(noise_df, aes(PC, noise_fraction, color = r, group = r)) +
+  geom_line(linewidth = 0.5) +
+  ### Green line: fraction of total variance explained by each PC, for comparison with the predicted noise fractions.
+    geom_line(data = data.frame(PC = seq_along(var_explained_barcoded),
+                              ve = var_explained_barcoded),
+            aes(PC, ve, linetype = "Total variance"), inherit.aes = FALSE,
+            colour = "darkgreen", linewidth = 0.5) +
+  scale_linetype_manual(name = NULL, values = c("Total variance" = "solid")) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "gray40") +
+  geom_hline(yintercept = 0.8, linetype = "dotted", color = "red") +
+  annotate("text", x = 200, y = 0.8, label = "80% noise", hjust = 8.5, vjust = 2, size = 3.2, color = "red") +
+   scale_x_log10(
+    breaks = scales::log_breaks(n = 5),
+    minor_breaks = scales::minor_breaks_n(10),
+    labels = scales::label_log()
+  ) +
+   scale_y_log10(
+    breaks = scales::log_breaks(n = 5),
+    minor_breaks = scales::minor_breaks_n(10),
+    labels = scales::label_log()
+  ) +
+  scale_color_viridis_c(name = "Assumed r", option = "turbo") +
+   theme_minimal(base_size = 10) +
+  theme(
+    panel.grid.minor = element_line(color = "gray90", linetype = "solid",linewidth = 0.12),
+    panel.grid.major = element_line(color = "gray80", linetype = "solid",linewidth = 0.23)
+  ) +
+  labs(x = "PC", y = "Proportion of variance")
+
+
+### Number of PCs with predicted noise fraction below 80%, for each assumed r
+noise_df %>% group_by(r) %>% summarise(n_PCs_below_80 = sum(noise_fraction < 0.8)) %>% print()
+
+print(seq_fish_noise)
+seq_fish_noise_legend <- get_legend(seq_fish_noise)
+
+seq_fish_noise_no_legend <- seq_fish_noise + theme(legend.position = "none")
+
+
+ggsave("Data/Fig_seqfish_noise_legend.svg", plot = seq_fish_noise_legend,
+       width = 1, height = 3, units = "in",
+       dpi = 300)  
+
+ggsave("Data/Fig_seqfish_noise.svg", plot = seq_fish_noise_no_legend,
+       width = 3, height = 2, units = "in",
+       dpi = 300)  
+```
+
+### 8. Maps of two fields of view coloured by PC score (Fig 2. B)
+
+```{r}
+
+### FOVs 52 and 53; PCs 1, 8 and 100
+scores_br <- pca_br$x
+fov_ids <- c(52, 53)
+pcs_map <- c("PC1", "PC8", "PC100")
+### set colour scale 
+cols <- colorRampPalette(c("#FFFFFF", "#08306B"))(100)
+
+Full_DF_for_plot <- Full_DF
+### convert to um
+Full_DF_for_plot$X_um <- Full_DF$X * (216/1024)
+
+Full_DF_for_plot$Y_um <- Full_DF$Y* (216/1024)
+
+## make the plot
+ plist <- list()
+ store <-1 
+for (fov_id in fov_ids) {
+  for (pc in pcs_map) {
+    idx <- which(Full_DF_for_plot$fov == fov_id)
+    plot_df <- Full_DF_for_plot[idx,]
+    vals <- scores_br[idx, pc]
+    ### scores are standardised within each FOV and clipped at ±2 SD for display 
+    vals_scaled <- (vals - mean(vals)) / sd(vals)
+    vals_clamped <- pmax(pmin(vals_scaled, 2), -2)
+    plot_df$vals_clamped <- vals_clamped
+
+  p <- ggplot(plot_df,aes(X_um,Y_um,colour=vals_clamped))+
+         geom_point() +
+     scale_colour_gradientn(colours = cols, limits = c(-2, 2),name = "PC score (SD)",
+    guide = guide_colourbar(
+    direction = "vertical",
+    barheight = unit(4, "cm"),
+    barwidth  = unit(0.3, "cm"),
+    ticks.colour = "white",
+    frame.colour = "white",
+    title.position = "right"
+  )) +
+       theme(panel.background = element_rect(fill = 'black'), 
+             panel.grid.major = element_blank(),
+             panel.grid.minor = element_blank(),
+             panel.border = element_rect(color = "red"),
+             axis.text = element_blank(),
+             axis.ticks = element_blank(),
+             axis.title = element_blank(),
+             plot.margin=unit(c(0.25,0,0.25,0), 'cm'),
+             plot.background = element_rect(fill = "black", colour = NA),
+             plot.title = element_text(colour = "white",size = 10),
+               legend.text = element_text(colour = "white"),
+               legend.box.spacing = unit(0.1, "cm"),
+  legend.title = element_text(colour = "white",angle=270),
+  legend.background = element_rect(fill = "black", colour = NA),
+  legend.key = element_rect(fill = "black", colour = NA)
+             ) + 
+    labs(title = (paste(pc))) +
+    coord_fixed(
+  xlim = c(-10, 226),
+  ylim = c(-10, 226),
+  expand = FALSE
+) 
+  
+     p<- p + annotate("segment", x = 10, xend = 60, y = 10, yend = 10, colour = "white", linewidth = 1) +annotate("text", x = 35, y = 18, label = "50 µm", colour = "white", size = 3)
+     
+  plist[[store]] <- p 
+  store <- store + 1 
+    
+  
+  }
+}
+
+
+
+
+ final_plot <- (
+  (plist[[1]] | plist[[2]] | plist[[3]]) /
+  (plist[[4]] | plist[[5]] | plist[[6]])
+) +
+  plot_layout(widths = c(1, 1, 1)) +
+  plot_annotation(
+    theme = theme(
+      plot.background = element_rect(fill = "black", colour = NA)
+    )
+  ) &
+  theme(
+    legend.position = "none"
+  )
+
+
+
+legend_grob <- get_legend(
+  plist[[1]] +
+    theme(
+      legend.position = "right",
+      legend.margin = margin(0, 0, 0, 0),
+      legend.box.margin = margin(0, 0, 0, 0)
+    )
+)
+
+legend_plot <- ggdraw(legend_grob) +
+  theme(
+    plot.background = element_rect(fill = "black", colour = NA)
+  )
+ggsave(
+  "Data/PC_score_legend.svg",
+  plot = legend_plot,
+  width = 1.2,
+  height = 2.4,
+  bg = "black"
+)
+
+
+
+ggsave("Data/Fig_seqfish_map.svg", plot = final_plot,
+       width = 3, height = 3, units = "in",
+       dpi = 300)  
+
+
+```
+### 9. Variance of PCs 4-13 relative to PCs 1-3 and PCs > 30
+
+```{r}
+### Mean variance per PC in each group; ratios quoted in the text (~46-fold and ~2-fold)
+ev <- pca_br$sdev^2
+mean(ev[1:3]) / mean(ev[4:13])       # how many times lower than PCs 1-3
+mean(ev[4:13]) / mean(ev[31:214])    # how many times higher than PCs > 30
+```
+
+

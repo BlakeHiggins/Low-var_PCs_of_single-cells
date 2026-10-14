@@ -1,0 +1,606 @@
+---
+title: "tonsil_pipeline_04"
+output: html_document
+date: "2026-08-26"
+---
+
+### Analysis of CyCIF tonsil dataset for "Are low-variance Principal Components of single-cell omics data biologically meaningful, or just noise?"
+### Data source. 
+#https://elifesciences.org/articles/31657#content
+
+### Runs main analysis: PCA on 30 channels; spatial correlation by neighbour rank within and between sections (1000 nearest neighbours); exponential fits; predicted noise fraction per PC from repeat-stained markers
+### Inputs: TONSILA_aligned_corrected.csv TONSILB_reordered_corrected.csv
+### Outputs: Panels for figure 1. 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### libraries 
+
+```{r}
+library("tidyverse")
+library(cowplot)
+library(ggplot2)
+```
+
+### functions 
+```{r}
+
+### Find NN, return NN index and distances 
+find_neighbours_with_dist <- function(datA_centroids, query_coords, k, drop_self = TRUE) {
+  extra <- if (drop_self) 1L else 0L  
+  ### If drop_self is TRUE, find one extra neighbour, because the cell itself is returned first
+  knn <- RANN::nn2(data = as.matrix(datA_centroids),
+                   query = as.matrix(query_coords), k = k + extra)
+  if (drop_self) {  ### Drop the first NN if drop self is true. so that within section queries do not count a cell as its own NN.
+    list(idx  = knn$nn.idx[, -1, drop = FALSE],
+         dist = knn$nn.dists[, -1, drop = FALSE])
+    ### If doing between sections do not drop one 
+  } else {
+    list(idx  = knn$nn.idx,
+         dist = knn$nn.dists)
+  }
+}
+
+### PC-level spatial correlation at each neighbour rank 
+pc_correlation <- function(x_scores, y_scores_full, neighbour_pairs) {
+  ### Get number of PC and number of NN
+  num_pcs <- ncol(x_scores); k <- ncol(neighbour_pairs)
+  cor_matrix <- matrix(NA, num_pcs, k,
+    dimnames = list(colnames(x_scores), paste0("Neighbor", 1:k)))
+  for (p in 1:num_pcs) {
+    x <- x_scores[, p]
+    for (c in 1:k) {
+      ### Correlation, across cells, between each cell's PC score and the score of its neighbour at this rank.
+      y <- y_scores_full[neighbour_pairs[, c], p]
+      cor_matrix[p, c] <- cor(x, y, use = "complete.obs")
+    }
+  }
+  cor_matrix
+}
+
+
+### Returns the decay-curve plot for one PC (within and between sections), with its legend; x is the mean distance at each neighbour rank
+make_pc_plot <- function(pc) {
+
+  ### Observed correlation at each neighbour rank, for the three pairings
+  decay_df_pc <- bind_rows(
+    data.frame(pair = "A → A", dist = mean_d_AA, cor = as.numeric(cAA[pc, ])),
+    data.frame(pair = "A → B", dist = mean_d_AB, cor = as.numeric(cAB[pc, ])),
+    data.frame(pair = "B → B", dist = mean_d_BB, cor = as.numeric(cBB[pc, ]))
+  )
+
+  ### Fitted exponential curve for each pairing
+  ft_pc  <- fit_table[fit_table$PC == pc, ]
+  fit_df <- bind_rows(lapply(seq_len(nrow(ft_pc)), function(i) {
+    row <- ft_pc[i, ]
+    if (is.na(row$A) || is.na(row$lambda)) return(NULL)
+    pair_label <- gsub("->", "→", row$pair)
+    d_range <- decay_df_pc$dist[decay_df_pc$pair == pair_label]
+    d_seq   <- seq(min(d_range), max(d_range), length.out = 200)
+    data.frame(pair = pair_label, dist = d_seq,
+               cor = row$A * exp(-d_seq / row$lambda))
+  }))
+
+  ggplot(decay_df_pc, aes(x = dist, y = cor, colour = pair)) +
+    geom_point(size = 0.2, alpha = 0.7, stroke = 0.8) +
+    coord_cartesian(ylim = y_lims, xlim = x_lims) +
+    geom_line(data = fit_df, aes(x = dist, y = cor, group = pair),
+              inherit.aes = FALSE,
+              colour = "red", linetype = 6, linewidth = 0.6, alpha = 0.35) +
+    geom_hline(yintercept = 0, linetype = "dotted", colour = "grey50") +
+    scale_color_manual(values = c("A → A" = "grey40", "B → B" = "#E07B54", "A → B" = "#3D7EA6")) +
+    theme_minimal(base_size = 8) +
+    labs(x = "Distance (μm)", y = "Correlation") +
+    theme(
+      panel.grid.minor = element_line(color = "gray90", linetype = "solid", linewidth = 0.12),
+      panel.grid.major = element_line(color = "gray80", linetype = "solid", linewidth = 0.23)
+    )
+}
+
+
+### Fit an exponential decay curve to a correlation decay curve  
+### Fit C(d) = A * exp(-d / L), where A is the correlation amplitude and L is the length scale.
+fit_exponential_decay <- function(dist, corr) {
+  df_fit <- data.frame(d = dist, corr = as.numeric(corr)) %>%
+    filter(is.finite(corr), is.finite(d))
+  if (nrow(df_fit) < 10) return(c(A=NA, lambda=NA, A_se=NA, lambda_se=NA))
+  #### Starting value for L: the distance at which the correlation is closest to 1/e of its maximum, with a minimum of 5 µm
+  corr_thresh <- max(df_fit$corr) / exp(1)
+  L_start <- df_fit$d[which.min(abs(df_fit$corr - corr_thresh))]
+  L_start <- max(L_start, 5)
+  
+  fit <- tryCatch(
+    nls(corr ~ A * exp(-d / L), data = df_fit,
+        ### Initialize A as the maximum observed correlation.  
+        start = list(A = max(df_fit$corr), L = L_start),
+        lower = c(A = -1, L = min(df_fit$d)),
+        upper = c(A = 1, L = max(df_fit$d)),
+        algorithm = "port"),
+    error = function(e) NULL)
+  
+  ### fallback if first attempt fails
+  if (is.null(fit)) {
+    fit <- tryCatch(
+      nls(corr ~ A * exp(-d / L), data = df_fit,
+          start = list(A = 0.01, L = 100),
+          lower = c(A = -1, L = min(df_fit$d)),
+          upper = c(A = 1, L = max(df_fit$d)),
+          algorithm = "port"),
+      error = function(e) NULL)
+  }
+  ### return outputs
+  if (is.null(fit)) return(c(A=NA, lambda=NA, A_se=NA, lambda_se=NA))
+  sm <- summary(fit)$coefficients
+  c(A = sm["A","Estimate"], lambda = sm["L","Estimate"],
+    A_se = sm["A","Std. Error"], lambda_se = sm["L","Std. Error"])
+}
+
+### Helper function to feed all the PC into the fitting function 
+fit_all_pcs <- function(cor_mat, mean_d, pair_name) {
+
+  out <- lapply(rownames(cor_mat), function(pc) {
+
+    params <- fit_exponential_decay(mean_d, cor_mat[pc, ])
+
+    data.frame(
+      PC       = pc,
+      pair     = pair_name,
+      A        = params["A"],
+      lambda   = params["lambda"],
+      A_se     = params["A_se"],
+      lambda_se = params["lambda_se"],
+      row.names = NULL
+    )
+  })
+
+  do.call(rbind, out)
+}
+
+```
+
+### 1. Load flat-field corrected, affine aligned and reordered data from scripts 01-03  
+```{r}
+#### load flat-field  corrected, affine aligned and reordered data  
+A_reg_trimmed<- read.csv("Data/TONSILA_aligned_corrected.csv")
+
+
+
+tonsilB_trimmed <- read.csv("Data/TONSILB_reordered_corrected.csv")
+
+### The 48 marker channels (columns 17 to 64)
+marker_cols <- names(A_reg_trimmed)[17:64]
+
+```
+
+
+```{r}
+### Pull out flat-field corrected markers and rename 
+
+
+A_bf_markers <-  A_reg_trimmed[, grep("_bf", colnames(A_reg_trimmed), value = TRUE)]
+
+
+
+B_bf_markers <- tonsilB_trimmed[, grep("_bf", colnames(tonsilB_trimmed), value = TRUE)]
+
+
+### Remove the _bf suffix so column names match the channel names 
+colnames(A_bf_markers) <- sub("_bf", "", colnames(A_bf_markers))
+colnames(B_bf_markers) <- sub("_bf", "", colnames(B_bf_markers))
+
+
+```
+
+
+### 2. Filter data and run PCA 
+```{r}
+###  Exclude auto-fluorescence channels, repeated reference stains, and channels that failed QC
+###### Channels dropped for quality reasons (staining artefacts, poor signal quality, or late-cycle tissue loss
+drop_sus <- c("Cy3_15", "Cy5_5", "Cy3_4", "FITC_5", "Cy3_9", "Cy5_15")
+#### repeat measurements of PCNA, Vimentin, and Tubulin
+drop_ref <- c("FITC_7", "Cy3_7", "Cy5_7", "FITC_12", "Cy3_12", "Cy5_12",
+              "FITC_16", "Cy3_16", "Cy5_16")
+### auto-fluorescence
+drop_af <- c("FITC_1", "Cy3_1", "Cy5_1")
+drop_all <- c(drop_sus, drop_ref, drop_af)
+keep_30 <- setdiff(marker_cols, drop_all)
+
+
+### Keep the 30 retained channels
+A_markers_for_pc <- A_bf_markers[, keep_30]
+B_markers_for_pc <- B_bf_markers[, keep_30]
+
+### Center but do not scale the markers 
+A_centered <- scale(A_markers_for_pc, center = TRUE, scale = FALSE)
+B_centered <- scale(B_markers_for_pc, center = TRUE, scale = FALSE)
+
+###  PCA on the centered Tonsil A data, without scaling
+pca <- prcomp(A_centered, center = FALSE, scale. = FALSE)
+
+### PCA scores for Tonsil A
+sA <- pca$x
+
+
+### PCA is fit on Tonsil A, and Tonsil B is projected using the Tonsil A loading
+sB <- B_centered %*% pca$rotation
+colnames(sA) <- paste0("PC", 1:ncol(sA))
+colnames(sB) <- paste0("PC", 1:ncol(sB))
+
+
+### Variance explained by each pc
+var_explained = pca$sdev^2 / sum(pca$sdev^2)
+```
+
+### 3. Calculate within- and between-section spatial correlation 
+```{r}
+### Spatial correlations (within and between sections) 
+
+### Number of nearest neighbours
+k_max <- 1000
+### Create matrix of single cell coordinates  
+coords_A_raw <- as.matrix(A_reg_trimmed[, c("Xt", "Yt")])
+coords_A_aff <- as.matrix(A_reg_trimmed[, c("Xt_aff", "Yt_aff")])
+coords_B_raw <- as.matrix(tonsilB_trimmed[, c("Xt", "Yt")])
+
+### Find the NN for within sections and between sections  using affine aligned coordinates for A -> B 
+nb_AA <- find_neighbours_with_dist(coords_A_raw, coords_A_raw,
+                                   k_max, drop_self = TRUE)
+
+nb_AB <- find_neighbours_with_dist(coords_B_raw, coords_A_aff,
+                                   k_max, drop_self = FALSE)
+
+nb_BB <- find_neighbours_with_dist(coords_B_raw, coords_B_raw,
+                                   k_max, drop_self = TRUE)
+ 
+
+### Mean distance at each neighbour rank (the x axis of the decay curves)
+mean_d_AA <- colMeans(nb_AA$dist)
+mean_d_AB <- colMeans(nb_AB$dist)
+mean_d_BB <- colMeans(nb_BB$dist)
+
+
+### For each PC, calculate the Pearson correlation between cell scores and neighbour scores at each neighbour rank.
+cAA <- pc_correlation(sA, sA, nb_AA$idx)
+cAB <- pc_correlation(sA, sB, nb_AB$idx)
+cBB <- pc_correlation(sB, sB, nb_BB$idx)
+```
+
+
+
+
+### 4. Fit exponential decay curves to each pc for between and within sections
+```{r}
+### fits using C(d) = A·exp(−d/L), with bounds of A between −1 and 1, and L between the smallest and largest distance.
+fit_table <- rbind(
+  fit_all_pcs(cAA, mean_d_AA, "A -> A"),
+  fit_all_pcs(cAB, mean_d_AB, "A -> B"),
+  fit_all_pcs(cBB, mean_d_BB, "B -> B"))
+
+
+### add PC number for plotting 
+fit_table$pc_num <- as.numeric(gsub("PC", "", fit_table$PC))
+
+```
+
+
+
+### 5. Make figure 1D (fit parameters)
+```{r}
+
+pcs_to_show <- c("PC1","PC5","PC10","PC15","PC20","PC25","PC30")
+
+pair_cols <- c("A -> A" = "grey40", "A -> B" = "#3D7EA6", "B -> B" = "#E07B54")
+
+### L for each comparison, by PC
+L_plot <- ggplot(fit_table, aes(x = pc_num, y = lambda, colour = pair)) +
+  geom_point(size = 0.5) +
+  scale_colour_manual(values = pair_cols, name = "Pair") +
+  theme_minimal(base_size = 10) +
+  labs(x = "PC", y = "L (μm)") +
+  theme(
+    panel.grid.minor = element_line(color = "gray90", linetype = "solid", linewidth = 0.12),
+    panel.grid.major = element_line(color = "gray80", linetype = "solid", linewidth = 0.23)
+  )
+
+### A for each comparison, by PC
+A_plot <- ggplot(fit_table, aes(x = pc_num, y = A, colour = pair)) +
+  geom_point(size = 0.5) +
+  scale_colour_manual(values = pair_cols, name = "Pair") +
+  theme_minimal(base_size = 10) +
+  labs(x = "PC", y = "A") +
+  theme(
+    panel.grid.minor = element_line(color = "gray90", linetype = "solid", linewidth = 0.12),
+    panel.grid.major = element_line(color = "gray80", linetype = "solid", linewidth = 0.23)
+  )
+### A and L share a legend 
+A_plot_legend    <- get_legend(A_plot)
+
+###save out plots with out legend 
+A_plot_no_legend <- A_plot + theme(legend.position = "none")
+L_plot_no_legend <- L_plot + theme(legend.position = "none")
+
+ggsave("Data/Fig_ton_param_legend.svg", plot = A_plot_legend,
+       width = 2, height = 3, units = "in", dpi = 300)
+ggsave("Data/Fig_ton_A.svg", plot = A_plot_no_legend,
+       width = 2, height = 1.5, units = "in", dpi = 300)
+ggsave("Data/Fig_ton_L.svg", plot = L_plot_no_legend,
+       width = 2, height = 1.5, units = "in", dpi = 300)
+
+
+
+
+```
+
+
+
+### 6. Make  figure 1C (decay curve plots for selected PCs) 
+```{r}
+pcs_all <- c("PC1", "PC10", "PC20")   # every PC that gets its own panel
+
+# Shared axis ranges across all PCs and all three pairings
+all_cor <- c(cAA[pcs_all, ], cAB[pcs_all, ], cBB[pcs_all, ])
+y_lims  <- c(min(0, all_cor, na.rm = TRUE), max(all_cor, na.rm = TRUE))
+x_lims  <- c(0, max(mean_d_AA, mean_d_AB, mean_d_BB))
+
+
+# One panel per PC, saved without its legend
+for (pc in pcs_all) {
+  p <- make_pc_plot(pc)
+  print(p)
+  ggsave(paste0("Data/Fig_ton_curve_pc_", pc, ".svg"),
+         plot = p + theme(legend.position = "none"),
+         width = 1.5, height = 1.5, units = "in", dpi = 300)
+}
+
+# The legend is the same for every panel, so take it from the first
+curve_legend <- get_legend(make_pc_plot(pcs_all[1]))
+ggsave("Data/Fig_ton_curve_legend.svg", plot = curve_legend,
+       width = 1.5, height = 2.5, units = "in", dpi = 300)
+```
+
+
+### 7. Make figure 1B (Map of single cells coloured by PC20) 
+
+```{r}
+pc_index <- 20
+pc_col <- paste0("PC", pc_index)
+ pca_scores <- as.data.frame(pca$x)
+pca_scores$Xt <- A_reg_trimmed$Xt
+pca_scores$Yt <- A_reg_trimmed$Yt
+
+####Scores for B projected into A
+pca_scores_B_into_A <- as.data.frame(sB)
+pca_scores_B_into_A$Xt <- tonsilB_trimmed$Xt
+pca_scores_B_into_A$Yt <- tonsilB_trimmed$Yt
+
+
+### Colour limits are the 2.5th and 97.5th percentiles of the section A scores, applied to both sections.
+lo <- quantile(pca_scores[[pc_col]], 0.025, na.rm = TRUE)
+hi <- quantile(pca_scores[[pc_col]], 0.975, na.rm = TRUE)
+
+cols    <- colorRampPalette(c("#FFFFFF", "#08306B"))(100)   # same as seqFISH/IMC
+bar_len <- 1000                                               #µm
+
+# scale bar in the empty bottom-right corner (per section)
+bar_A <- c(x1 = max(pca_scores$Xt) - 300 - bar_len, x2 = max(pca_scores$Xt) - 300,
+           y  = min(pca_scores$Yt) + 400)
+bar_B <- c(x1 = max(pca_scores_B_into_A$Xt) - 300 - bar_len, x2 = max(pca_scores_B_into_A$Xt) - 300,
+           y  = min(pca_scores_B_into_A$Yt) + 400)
+
+
+
+
+p_A <- ggplot(pca_scores, aes(x = Xt, y = Yt, color = .data[[pc_col]])) +
+  geom_point(size = 0.03) +
+  scale_colour_gradientn(colours = cols, limits = c(lo, hi), oob = scales::squish,
+                         name = "PC20 score") +
+  theme_minimal(base_size = 10) +
+  coord_fixed() +
+  theme(legend.position = "none") +
+  labs(x = NULL, y = NULL) +theme(panel.background = element_rect(fill = 'black'), 
+             panel.grid.major = element_blank(),
+             panel.grid.minor = element_blank(),
+             panel.border = element_rect(color = "red"),
+             axis.text = element_blank(),
+             axis.ticks = element_blank(),
+             axis.title = element_blank(),
+             #legend.position = "none",
+             plot.margin=unit(c(0.25,0,0.25,0), 'cm'),
+             plot.background = element_rect(fill = "black", colour = NA),
+             plot.title = element_text(colour = "white",size = 10),
+               legend.text = element_text(colour = "white"),
+               legend.box.spacing = unit(0.1, "cm"),
+  legend.title = element_text(colour = "white",angle=270),
+  legend.background = element_rect(fill = "black", colour = NA),
+  legend.key = element_rect(fill = "black", colour = NA)
+             ) +  annotate("segment", x = bar_A["x1"], xend = bar_A["x2"], y = bar_A["y"], yend = bar_A["y"],
+           colour = "white", linewidth = 1) 
+
+p_B <- ggplot(pca_scores_B_into_A, aes(x = Xt, y = Yt, color = .data[[pc_col]])) +
+  geom_point(size = 0.03) +
+  scale_colour_gradientn(colours = cols, limits = c(lo, hi), oob = scales::squish,
+                         name = "PC20 score") +
+  theme_minimal(base_size = 10) +
+  coord_fixed() +
+  theme(legend.position = "none") +
+  labs(x = NULL, y = NULL) +theme(panel.background = element_rect(fill = 'black'), 
+             panel.grid.major = element_blank(),
+             panel.grid.minor = element_blank(),
+             panel.border = element_rect(color = "red"),
+             axis.text = element_blank(),
+             axis.ticks = element_blank(),
+             axis.title = element_blank(),
+        
+             plot.margin=unit(c(0.25,0,0.25,0), 'cm'),
+             plot.background = element_rect(fill = "black", colour = NA),
+             plot.title = element_text(colour = "white",size = 10),
+               legend.text = element_text(colour = "white"),
+               legend.box.spacing = unit(0.1, "cm"),
+  legend.title = element_text(colour = "white",angle=270),
+  legend.background = element_rect(fill = "black", colour = NA),
+  legend.key = element_rect(fill = "black", colour = NA)
+             ) +  annotate("segment", x = bar_B["x1"], xend = bar_B["x2"], y = bar_B["y"], yend = bar_B["y"],
+           colour = "white", linewidth = 1) 
+ # annotate("text", x = mean(bar_B[c("x1", "x2")]), y = bar_B["y"] + 350,
+          # label = "1 mm", colour = "white", size = 3) 
+
+print(p_A)
+print(p_B)
+p_legend <- p_A + theme(legend.position = "right",
+                        legend.text  = element_text(colour = "black"),
+                        legend.title = element_text(colour = "black", angle = 270),
+                        legend.background = element_rect(fill = "white", colour = NA)) +
+  guides(colour = guide_colourbar(barheight = unit(4, "cm"), barwidth = unit(0.3, "cm"),
+                                  ticks.colour = "black", frame.colour = "black",
+                                  title.position = "right"))
+
+legend_only <- cowplot::get_legend(p_legend)
+ggsave("Data/fig_ton_map_legend.svg", plot = legend_only, width = 1, height = 3, units = "in", dpi = 300)
+
+ggsave("Data/Fig_tonA_PC20.png", plot = p_A, width = 2, height = 2, units = "in", dpi = 300,bg = "white")
+ggsave("Data/Fig_tonB_PC20.png", plot = p_B, width = 2, height = 2, units = "in", dpi = 300,bg="white")
+```
+
+### 8. Noise estimation and make figure 1A (Estimated noise fraction of each PC)
+
+```{r}
+### Loss for estimating r_1…r_4, where r_i is the correlation of repeat i with the true signal. The model correlation matrix has off-diagonal elements r_i·r_j; loss = log det Σ + tr(SΣ⁻¹), with S the observed correlation matrix. r = tanh(z) keeps each r between −1 and 1.
+### Each repeat is the true signal plus independent noise, so the correlation between repeats i and j is r_i × r_j.
+loss_function_z4 <- function(z, S) {
+  r <- tanh(z)
+  Sigma <- matrix(c(
+    1,         r[1]*r[2], r[1]*r[3], r[1]*r[4],
+    r[1]*r[2], 1,         r[2]*r[3], r[2]*r[4],
+    r[1]*r[3], r[2]*r[3], 1,         r[3]*r[4],
+    r[1]*r[4], r[2]*r[4], r[3]*r[4], 1
+  ), nrow = 4, byrow = TRUE)
+
+  inv_Sigma <- solve(Sigma)
+  logdet    <- determinant(Sigma, logarithm = TRUE)$modulus
+  tr_term   <- sum(S * inv_Sigma)
+  loss      <- as.numeric(logdet + tr_term)
+  return(loss)
+}
+### PCNA, Vimentin, and Tubulin were each measured four times in both sections.
+
+pcna_A_cov <- cov(as.matrix(A_bf_markers[, paste0("FITC_", c(3, 7, 12, 16))]))
+vim_A_cov  <- cov(as.matrix(A_bf_markers[, paste0("Cy3_",  c(3, 7, 12, 16))]))
+tub_A_cov  <- cov(as.matrix(A_bf_markers[, paste0("Cy5_",  c(3, 7, 12, 16))]))
+
+pcna_B_cov <- cov(as.matrix(B_bf_markers[, paste0("FITC_", c(3, 7, 12, 16))]))
+vim_B_cov  <- cov(as.matrix(B_bf_markers[, paste0("Cy3_",  c(3, 7, 12, 16))]))
+tub_B_cov  <- cov(as.matrix(B_bf_markers[, paste0("Cy5_",  c(3, 7, 12, 16))]))
+
+### Pairwise repeat correlations are used to estimate technical-noise variance
+pcna_A_cor <- cov2cor(pcna_A_cov)
+vim_A_cor  <- cov2cor(vim_A_cov)
+tub_A_cor  <- cov2cor(tub_A_cov)
+
+pcna_B_cor <- cov2cor(pcna_B_cov)
+vim_B_cor  <- cov2cor(vim_B_cov)
+tub_B_cor  <- cov2cor(tub_B_cov)
+### For each marker and section, fit the four r values to the six pairwise correlations. 
+### Noise variance of each repeat = its variance  × (1 − r²). 
+###Four repeats × three markers × two sections = 24 estimates.
+g <- function(z) loss_function_z4(z, pcna_A_cor)
+result <- optim(rep(1.5, 4), g, method = "BFGS")
+r_final <- tanh(result$par)
+var_epsilon_pcnaA <- diag(pcna_A_cov) * (1 - r_final^2)
+
+g <- function(z) loss_function_z4(z, vim_A_cor)
+result <- optim(rep(1.5, 4), g, method = "BFGS")
+r_final <- tanh(result$par)
+var_epsilon_vimA <- diag(vim_A_cov) * (1 - r_final^2)
+
+g <- function(z) loss_function_z4(z, tub_A_cor)
+result <- optim(rep(1.5, 4), g, method = "BFGS")
+r_final <- tanh(result$par)
+var_epsilon_tubA <- diag(tub_A_cov) * (1 - r_final^2)
+
+g <- function(z) loss_function_z4(z, pcna_B_cor)
+result <- optim(rep(1.5, 4), g, method = "BFGS")
+r_final <- tanh(result$par)
+var_epsilon_pcnaB <- diag(pcna_B_cov) * (1 - r_final^2)
+
+g <- function(z) loss_function_z4(z, vim_B_cor)
+result <- optim(rep(1.5, 4), g, method = "BFGS")
+r_final <- tanh(result$par)
+var_epsilon_vimB <- diag(vim_B_cov) * (1 - r_final^2)
+
+g <- function(z) loss_function_z4(z, tub_B_cor)
+result <- optim(rep(1.5, 4), g, method = "BFGS")
+r_final <- tanh(result$par)
+var_epsilon_tubB <- diag(tub_B_cov) * (1 - r_final^2)
+
+var_epsilon <- c(
+  as.numeric(var_epsilon_pcnaA),
+  as.numeric(var_epsilon_vimA),
+  as.numeric(var_epsilon_tubA),
+  as.numeric(var_epsilon_pcnaB),
+  as.numeric(var_epsilon_vimB),
+  as.numeric(var_epsilon_tubB)
+)
+
+
+### 3000 simulations: in each, every one of the 30 channels is assigned one of the 24 noise variances at random (with replacement), and the noise variance of each PC is the sum of channel noise variances weighted by squared loadings
+loadings <- pca$rotation
+a_sq     <- loadings^2
+npc      <- ncol(loadings)
+pc_var   <- pca$sdev^2
+
+set.seed(1)
+n_sim <- 3000
+
+eps_pool <- var_epsilon[var_epsilon >= 0]
+### each of the 30 markers is assigned one of the 24 noise variances at random.
+draws     <- matrix(sample(eps_pool, n_sim * npc, replace = TRUE), nrow = n_sim)
+sim_noise <- draws %*% a_sq
+### predicted noise variance of a PC ÷ its observed variance
+nf     <- sweep(sim_noise, 2, pc_var, "/")
+
+
+### Summary of  noise fractions 
+df <- data.frame(
+  PC      = 1:npc,
+  nf_mean = colMeans(nf),
+  ### 2.5th and 97.5th percentiles across simulations
+  ci_lo   = apply(nf, 2, quantile, 0.025),
+  ci_hi   = apply(nf, 2, quantile, 0.975),
+  var_explained = var_explained
+)
+
+
+###make Df for ploting fraction of varince explined by PC
+var_explained_plot <- as.data.frame(var_explained) %>% 
+  mutate(PC = 1:npc)
+
+Noise_plot_tonsil_log_scale<- ggplot(df, aes(PC, nf_mean)) +
+  geom_ribbon(aes(ymin = ci_lo, ymax = ci_hi), fill = "#FF474C", alpha = 0.5) +
+  geom_line(color = "red") +
+  geom_point(color = "red", size = 0.5) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "gray40") +
+  ### Green line: fraction of total variance explained by each PC, for comparison with the predicted noise fractions.
+  geom_line(aes(PC,var_explained),color = "darkgreen") +
+    geom_point(aes(PC,var_explained),color = "darkgreen", size = 0.5) +
+
+scale_y_log10(breaks = scales::log_breaks(n = 5), minor_breaks = scales::minor_breaks_n(10),
+                labels = scales::label_log()) +
+  labs(x = "PC", y = "Proportion of Variance") +
+  theme_minimal(base_size = 10) +
+  theme(panel.grid.major = element_line(linewidth = 0.25),
+        panel.grid.minor = element_line(linewidth = 0.15)) 
+
+print(Noise_plot_tonsil_log_scale)
+
+
+
+
+ggsave("Data/noise_fraction_per_PC_log_scale.svg", plot = Noise_plot_tonsil_log_scale,
+       width = 3, height = 2, units = "in",
+       dpi = 300)  
+```
+
+
+

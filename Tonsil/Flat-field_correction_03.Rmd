@@ -1,0 +1,84 @@
+---
+title: "Flat-field correction_03"
+output: html_document
+date: "2026-08-11"
+---
+
+
+
+### Script for Analysis of CyCIF tonsil dataset for "Are low-variance Principal Components of single-cell omics data biologically meaningful, or just noise?"
+
+### Filters cells, log-transforms marker intensities and apply a flat-field correction to Tonsil A and Tonsil B
+### Inputs: dataTONSILA_registered.csv   dataTONSILB_reordered.csv
+### Outputs: TONSILA_aligned_corrected.csv  TONSILB_reordered_corrected.csv
+
+### Data source. 
+#https://elifesciences.org/articles/31657#content
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Step 1. Load Tonsil data. 
+```{r}
+
+### Tonsil A has been aligned to tonsil B using an affine registration (see script affine_registration_01.m).
+### Tonsil B has been reordered (see script Reorder_02.Rmd).
+
+A_reg <- read.csv("Data/dataTONSILA_registered.csv")
+tonsilB <- read.csv("Data/dataTONSILB_reordered.csv")
+
+### Exclude Tonsil A cells whose affine-transformed coordinates fall outside Tonsil B field of view.
+A_reg <- A_reg[A_reg$valid == 1, ]
+
+### all 48 Marker-intensity columns 
+marker_cols <- names(A_reg)[17:64]
+
+### Step 2. Exclude cells within ~50 units of tile edges to avoid segmentation artifacts and illumination boundary effects.
+A_reg_trimmed <- A_reg[A_reg$X > 50 & A_reg$X < 1620 &
+                       A_reg$Y > 50 & A_reg$Y < 1350, ]
+tonsilB_trimmed <- tonsilB[tonsilB$X > 50 & tonsilB$X < 1620 &
+                           tonsilB$Y > 50 & tonsilB$Y < 1350, ]
+
+### Step 3. Initialize matrices for spatially corrected marker intensities.
+corrected_A <- matrix(NA, nrow(A_reg_trimmed), length(marker_cols),
+                      dimnames = list(NULL, marker_cols))
+corrected_B <- matrix(NA, nrow(tonsilB_trimmed), length(marker_cols),
+                      dimnames = list(NULL, marker_cols))
+
+### Step 4: For each marker, log-transform marker intensity and fit a fifth-degree polynomial surface as a function of within-tile X and Y coordinates.
+### The fitted surface represents smooth spatial variation in measured  marker intensity, and model residuals are retained as corrected values.
+### Each section uses its own unregistered within tile coordinates for correction
+
+for (m in marker_cols) {
+  fitA <- lm(log(A_reg_trimmed[[m]]) ~ poly(X, Y, degree = 5), data = A_reg_trimmed)
+  corrected_A[, m] <- residuals(fitA)
+  fitB <- lm(log(tonsilB_trimmed[[m]]) ~ poly(X, Y, degree = 5), data = tonsilB_trimmed)
+  corrected_B[, m] <- residuals(fitB)
+}
+
+```
+
+
+
+
+
+
+```{r}
+### Step 5: save out residual data. 
+###  Residuals : log-intensity variation remaining after removal of the fitted within-tile spatial intensity trend.
+
+### Append "_bf" to corrected marker names (marks flat-field-corrected values).
+colnames(corrected_A) <- paste0(marker_cols, "_bf")
+colnames(corrected_B) <- paste0(marker_cols, "_bf")
+
+### Combine original measurements with spatially corrected marker values.
+A_out <- cbind(A_reg_trimmed, corrected_A)
+B_out <- cbind(tonsilB_trimmed, corrected_B)
+### Save out as csv
+write.csv(A_out, "Data/TONSILA_aligned_corrected.csv", row.names = FALSE)
+write.csv(B_out, "Data/TONSILB_reordered_corrected.csv", row.names = FALSE)
+```
+
+
+

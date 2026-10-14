@@ -1,0 +1,594 @@
+---
+title: "IMC_pipeline_02"
+output: html_document
+date: "2026-08-25"
+---
+### Script for Analysis of 3D IMC of breast carcinoma dataset for "Are low-variance Principal Components of single-cell omics data biologically meaningful, or just noise?"
+### Data source. 
+# https://www.nature.com/articles/s43018-021-00301-w
+
+### PCA on 24 markers; spatial correlation by neighbour rank within slices and between slices at every gap (300 nearest neighbours); amplitude A and length scale L from the within-slice curves; mean absolute error between within-slice and between-slice curves; figure 3 panels.
+### inputs model201710_cells_with_positions.csv  
+### outputs panels for figure 3.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+### Load libraries
+
+```{r}
+library(tidyverse)
+library(RANN)
+library(cowplot)
+library(ggnewscale)
+```
+
+### Functions 
+
+```{r}
+#### Find k nearest neighbours and return neighbour indices and distances
+find_neighbours_with_dist <- function(data_coords, query_coords, k, drop_self = TRUE) {
+  extra <- if (drop_self) 1L else 0L
+  knn <- RANN::nn2(data = as.matrix(data_coords),
+                   query = as.matrix(query_coords), k = k + extra)
+  ### drop_self = TRUE for within-slice queries (each cell’s first neighbour is itself); FALSE for between-slice queries
+  if (drop_self) {
+    list(idx  = knn$nn.idx[, -1, drop = FALSE],
+         dist = knn$nn.dists[, -1, drop = FALSE])
+  } else {
+    list(idx  = knn$nn.idx,
+         dist = knn$nn.dists)
+  }
+}
+
+
+### Compute Pearson correlation between each cell's PC score and its neighbour at each NN rank
+pc_correlation <- function(pc_scores_x, pc_scores_y, neighbour_pairs) {
+  num_pcs <- ncol(pc_scores_x); k <- ncol(neighbour_pairs)
+  cm <- matrix(NA, num_pcs, k, dimnames = list(colnames(pc_scores_x), NULL))
+  for (p in 1:num_pcs) {
+    x <- pc_scores_x[, p]
+    for (c in 1:k) cm[p, c] <- cor(x, pc_scores_y[neighbour_pairs[, c], p], use = "complete.obs")
+  }
+  cm
+}
+
+
+
+### Fit exponential spatial-decay curves
+# Fit C(d) = A * exp(-d / L), where A is the correlation amplitude and L is the length scale.
+### Used only for the red dashed lines in Fig 3B; A and L in Fig 3C and 3D come from section 5
+fit_exponential_decay <- function(dist, corr) {
+  df_fit <- data.frame(d = dist, corr = as.numeric(corr)) %>%
+    filter(is.finite(corr), is.finite(d))
+  if (nrow(df_fit) < 10) return(c(A=NA, lambda=NA, A_se=NA, lambda_se=NA))
+ #### Starting value for L: the distance at which the correlation is closest to 1/e of its maximum, with a minimum of 5 µm
+  corr_thresh <- max(df_fit$corr) / exp(1)
+  L_start <- df_fit$d[which.min(abs(df_fit$corr - corr_thresh))]
+  L_start <- max(L_start, 5)
+  
+  fit <- tryCatch(
+    nls(corr ~ A * exp(-d / L), data = df_fit,
+        ### Initialize A as the maximum observed correlation.  
+        start = list(A = max(df_fit$corr), L = L_start),
+        lower = c(A = -1, L = min(df_fit$d)),
+        upper = c(A = 1, L = max(df_fit$d)),
+        algorithm = "port"),
+    error = function(e) NULL)
+  
+  # fallback if first attempt fails
+  if (is.null(fit)) {
+    fit <- tryCatch(
+      nls(corr ~ A * exp(-d / L), data = df_fit,
+          start = list(A = 0.01, L = 100),
+          lower = c(A = -1, L = min(df_fit$d)),
+          upper = c(A = 1, L = max(df_fit$d)),
+          algorithm = "port"),
+      error = function(e) NULL)
+  }
+    ### return outputs
+  if (is.null(fit)) return(c(A=NA, lambda=NA, A_se=NA, lambda_se=NA))
+  sm <- summary(fit)$coefficients
+  c(A = sm["A","Estimate"], lambda = sm["L","Estimate"],
+    A_se = sm["A","Std. Error"], lambda_se = sm["L","Std. Error"])
+}
+```
+
+
+### 1. load in the data 
+
+```{r}
+###load in the data 
+df <- read.csv("Data/model201710_cells_with_positions.csv")
+```
+
+
+
+
+
+
+### 2. pull out markers 
+```{r}
+
+### Get the Markers 
+markers <- c("CK5", "CK19", "CK8.18", "CD68", "CK14", "SMA", "Vimentin",
+             "CD138", "CD3", "phospho.H3", "HER2..bis.",
+             "CD44", "CD45", "CD20", "CD8a", "Collagen.I",
+             "Ki.67", "pS6", "vWF..CD31", "E.P.Cadherin",
+             "CK7", "panCK", "cPARP.cCasp3","Histone.H3")
+```
+
+
+
+
+
+### 3. Log1p-transform marker intensities and perform PCA with centering and unit-variance scaling
+```{r}
+### log1p the markers 
+df[, markers] <- log1p(df[, markers])
+
+### Run PCA on the markers 
+### Each marker is centred and scaled to unit variance
+pca <- prcomp(df[, markers], center = TRUE, scale. = TRUE)
+
+#### append PC scores of markers to the dataframe  
+pc_cols <- paste0("PC", 1:length(markers))
+df[, pc_cols] <- pca$x
+```
+
+
+```{r}
+### Variance explained by each pc
+var_explained = pca$sdev^2 / sum(pca$sdev^2)
+
+
+### ~81% of the Variance is explained by PCs 1-9
+sum(var_explained[1:9])
+round(cumsum(var_explained), 3)
+
+```
+
+
+### 4. within and between slice correlation decay curve 
+### Within each z-slice, calculate PC-score correlation as a function of NN rank
+### Between slices, repeat for slice separations up to 150 planes
+### Convert between-slice XY distances to 3D distances using 2 µm z-spacing 
+### centroid_x and centroid_y are in pixels (1 pixel = 1 µm)
+### each cell is assigned to the slice nearest its centroid (cells were segmented in 3D)
+### Correlations and mean neighbour distances are computed per slice (or slice pair) and then averaged over slices
+```{r}
+### Group cells to their Z plane 
+df$slice <- round(df$centroid_z)
+
+### Get a list of these z planes 
+slices   <- sort(unique(df$slice))
+
+### How many NN to find 
+k_nn     <- 300
+
+### Maximum slice separation examined
+max_gap  <- 150
+
+### Distance between consecutive slices in µm 
+z_per_slice <- 2 
+
+
+
+### For storing cors within slices 
+cor_within_sum  <- matrix(0, length(pc_cols), k_nn, dimnames = list(pc_cols, NULL))
+
+### For storing dist within slices 
+dist_within_sum <- numeric(k_nn)
+
+#### Running count of how many slices contributed to the within-slice average
+count_within    <- 0
+
+### Storing correlations between slices, up to max gap
+cor_between_sum  <- setNames(lapply(1:max_gap, function(g) matrix(0, length(pc_cols), k_nn, dimnames = list(pc_cols, NULL))), 1:max_gap)
+
+### Storing distances between slices, up to max gap
+dist_between_sum <- setNames(lapply(1:max_gap, function(g) numeric(k_nn)), 1:max_gap)
+
+
+### For storing the number of slices that are compared across gaps  
+count_between    <- setNames(numeric(max_gap), 1:max_gap)
+
+### For each slice 
+for (i in seq_along(slices)) {
+  cat("slice", i, "of", length(slices), "\n")
+  s1 <- df[df$slice == slices[i], ]   ### Take  cells in that slice 
+  if (nrow(s1) < k_nn + 2) next    ### If there are more NN to take then cells skip 
+  coords_s1 <- as.matrix(s1[, c("centroid_x","centroid_y")])   #### Take the X and y for cells in slices 
+  scores_s1 <- as.matrix(s1[, pc_cols])                       ### PC scores (all PCs) of the cells in this slice
+
+  ### within-slice
+  nn_w <- find_neighbours_with_dist(coords_s1, coords_s1, k = k_nn,drop_self = T)   ###find NN within slice 
+  cor_within_sum  <- cor_within_sum  + pc_correlation(scores_s1, scores_s1, nn_w$idx) ###store results for cors within slice
+  dist_within_sum <- dist_within_sum + colMeans(nn_w$dist)             ### store distances within 
+  count_within    <- count_within + 1                                   ### keeps track of how many slices for avg
+
+  ### between-slice at each gap
+  for (g in 1:max_gap) {                  #### for each gap up to max gap 
+    j <- i + g; if (j > length(slices)) break  ### if take a gap that exceeds the total number of slices stop the loop 
+    s2 <- df[df$slice == slices[j], ]  #### j = the slice at the target gap (slice 1 at gap 1 takes slice 2, slice 3 at gap 50 takes 53)
+    if (nrow(s2) < k_nn + 1) next         ###if more NN then cells in slice skip 
+    coords_s2 <- as.matrix(s2[, c("centroid_x","centroid_y")])    ### take the x and y of the target slice 
+    scores_s2 <- as.matrix(s2[, pc_cols])                         ### take the scores of the target slice 
+    nn_b <- find_neighbours_with_dist(data_coords = coords_s2, query_coords = coords_s1, k = k_nn,drop_self = F) ### run NN
+   
+     dz   <- (slices[j] - slices[i]) * z_per_slice      ### space between two slices (in z)
+    dist_3d <- sqrt(nn_b$dist^2 + dz^2)  #### 3D distance = sqrt(in-plane distance² + dz²
+    cor_between_sum[[g]]  <- cor_between_sum[[g]]  + pc_correlation(scores_s1, scores_s2, nn_b$idx) 
+    dist_between_sum[[g]] <- dist_between_sum[[g]] + colMeans(dist_3d)  #### fill with mean of cell distance at that gap and that NN rank
+    count_between[g] <- count_between[g] + 1   #### keep track of how many  target pairs
+  }
+}
+
+cor_within_avg   <- cor_within_sum  / count_within   #### avg corr of within NN at each rank
+dist_within_avg  <- dist_within_sum / count_within   ####### avg dist of within NN at each rank
+cor_between_avg  <- setNames(lapply(1:max_gap, function(g) cor_between_sum[[g]]  / count_between[g]), 1:max_gap) ##same for gaps 
+dist_between_avg <- setNames(lapply(1:max_gap, function(g) dist_between_sum[[g]] / count_between[g]), 1:max_gap) ## same for gaps
+```
+
+
+
+### 5. Estimate within-slice correlation amplitude and length scale and make Fig 3. C
+###A and L for Fig 3 are estimated directly from the within-slice curves (A = first-neighbour correlation, L = distance where the curve falls to A/e), not from the exponential fits. 
+
+```{r}
+### Within-slice correlation curves, one column per PC
+Within_PCs_corr <- as.data.frame(t(cor_within_avg))
+
+### A = within-slice correlation at the first nearest neighbour 
+A <- Within_PCs_corr[1,]
+
+###  Target correlation 0.37·A (≈ A/e)
+Lamda_corr <- 0.37 * A
+L_df <- data.frame()
+
+### L = distance at which the within-slice correlation falls to 0.37·A, by linear interpolation 
+for(pc in pc_cols){
+ L_df[1,pc] <- approx(x =Within_PCs_corr[,pc],y = dist_within_avg, xout = Lamda_corr[pc])$y
+}
+
+
+###plot it out 
+df_plot <- data.frame(PC = pc_cols, A = as.numeric(A), L = as.numeric(L_df))
+df_plot <- df_plot %>% rownames_to_column()
+
+imc_param_plot <- ggplot(df_plot, aes(L, A, colour = as.numeric(rowname), label = PC)) +
+  geom_point(size = 1) +
+  scale_colour_viridis_c(name = "PC #") +
+  theme_minimal(base_size=10) +
+     theme(
+    panel.grid.minor = element_line(color = "gray90", linetype = "solid",linewidth = 0.12),
+    panel.grid.major = element_line(color = "gray80", linetype = "solid",linewidth = 0.23)
+  ) 
+
+
+
+imc_param_legend <- get_legend(imc_param_plot)
+
+imc_param_plot_nolegend <- imc_param_plot + theme(legend.position = "none")
+
+
+
+ggsave("Data/Fig_IMC_parameter_legend.svg", plot = imc_param_legend,
+       width = 1, height = 3, units = "in",
+       dpi = 300)  
+
+ggsave("Data/Fig_IMC_parameter.svg", plot = imc_param_plot_nolegend,
+       width = 2.5, height = 1.5, units = "in",
+       dpi = 300)  
+```
+
+
+
+### 6. Mean absolute error between within-slice and between-slice correlation curves Fig 3. D
+
+```{r}
+### Predict between-slice correlation from the within-slice distance-correlation curve
+### Compute mean absolute error between predicted and observed between-slice correlations
+results <- list()
+
+### Calculate MAE for every PC and slice gap 
+for(pc in pc_cols){
+  for(g in 1:max_gap) {
+    interp <- approx(dist_within_avg, cor_within_avg[pc, ], xout = dist_between_avg[[g]])$y ### get the predicted cor
+    residuals <- abs(cor_between_avg[[g]][pc, ] - interp)   ### Absolute residual between observed and predicted correlation
+    mae <- mean(residuals, na.rm = TRUE)
+    results[[length(results) + 1]] <- data.frame(PC = pc, gap = g, MAE = mae)
+  }
+}
+
+results <- do.call(rbind, results)
+### Gap distance in µm (gap × 2 µm)
+results$gap_dist <- results$gap*z_per_slice
+results$PC <- factor(results$PC, levels = pc_cols)
+results$PC_num <- as.numeric(gsub("PC","",results$PC))
+c0_df <- data.frame(PC = factor(pc_cols, levels = pc_cols), 
+                    A = as.numeric(A))
+
+l_vec <- as.vector(as.numeric(L_df))
+
+
+### For each PC, flag the gap whose distance is closest to L (blue crosses).
+results_test <- results %>%
+  mutate(L = l_vec[PC_num]) %>%
+  group_by(PC_num) %>%
+  mutate(
+    is_gap_decay = gap_dist == gap_dist[which.min(abs(gap_dist - L))]
+  ) %>%
+  ungroup()
+### seed for the horizontal jitter only (display)
+set.seed(42)
+results_test$x_jit <- as.numeric(results_test$PC) + runif(nrow(results_test), -0.15, 0.15)
+### Gaps of 131–150 slices (262–300 µm) lie beyond the within-slice curve (max 261 µm) and have no MAE; they are removed before plotting.
+results_test <- results_test %>% filter(is.finite(MAE))
+
+gmax <- max(results_test$gap_dist) 
+P <- ggplot(results_test) +
+  geom_violin(aes(x = as.numeric(PC), y = MAE, group = PC),
+              fill = "grey85", colour = NA, scale = "width", trim = TRUE) +
+  geom_point(data = results_test,
+             aes(x_jit, MAE, colour = gap_dist), size = 0.8, alpha = 0.6) +
+  scale_colour_viridis_c(name = "Gap distance (µm)", option = "magma",
+                         breaks = c(100, 200, gmax)) +
+  ggnewscale::new_scale_colour() +
+  geom_point(data = c0_df, 
+             aes(x = as.numeric(PC), y = A, colour = "A"),
+             shape = 18, size = 3) +
+  geom_point(data = filter(results_test, is_gap_decay),
+             aes(x_jit, MAE, colour = "Gap distance \u2248 L"), 
+             shape = 3, size = 1.2, stroke = 0.6) +
+  scale_colour_manual(
+    name = NULL,
+    values = c("A" = "red", "Gap distance \u2248 L" = "blue"),
+    guide = guide_legend(override.aes = list(
+      shape = c(18, 3),
+      size = c(3, 1.2)
+    ))
+  ) +
+  scale_x_continuous(breaks = c(1, 12, 24), labels = pc_cols[c(1, 12, 24)], minor_breaks = 1:24) +
+   scale_y_log10(breaks = scales::log_breaks(n = 5), minor_breaks = scales::minor_breaks_n(10),
+                labels = scales::label_log()) +
+  theme_minimal(base_size = 10) +
+  labs(x = "PC", y = "Mean Absolute Error") +
+     theme(
+    panel.grid.minor = element_line(color = "gray90", linetype = "solid",linewidth = 0.12),
+    panel.grid.major = element_line(color = "gray80", linetype = "solid",linewidth = 0.23)
+  ) 
+
+
+print(P)
+
+
+legend <- get_legend(P)
+
+P_no_legend <- P + theme(legend.position = "none")
+
+ggsave("Data/Fig_IMC_MAE.svg", plot = P_no_legend,
+       width = 2.5, height = 1.5, units = "in",
+       dpi = 300)
+
+ggsave("Data/Fig_IMC_MAE_legend.svg", plot = legend,
+       width = 3, height = 3.5, units = "in",
+       dpi = 300)
+```
+
+
+
+
+### 7.Decay curves within and between slices Fig 3. B
+
+```{r}
+### PCs and slice gaps shown in Figure 3B.
+pcs <- c("PC1", "PC18","PC24")
+gaps <- c(1,25,50)
+
+within_cor <- cor_within_avg[pcs, , drop = FALSE]
+
+between_df <- bind_rows(lapply(gaps, function(g) {
+  
+  mat <- cor_between_avg[[g]][pcs, , drop = FALSE]
+  
+  stopifnot(ncol(mat) == ncol(within_cor))
+  
+  data.frame(
+    PC = rep(pcs, each = ncol(mat)),
+    gap = g,
+    cor_gap = as.vector(t(mat)),
+    dist_gap = rep(dist_between_avg[[g]], times = length(pcs)),
+    cor_within = as.vector(t(within_cor)),
+    dist_within = rep(dist_within_avg, times = length(pcs))
+  )
+}))
+
+between_df$PC_num <- as.numeric(sub("PC", "", between_df$PC))
+
+
+fit_df <- bind_rows(lapply(pcs, function(pc) {
+  co <- fit_exponential_decay(dist_within_avg, within_cor[pc, ])
+  if (!all(is.finite(co))) return(NULL)
+  d_seq <- seq(min(dist_within_avg), max(dist_within_avg), length.out = 200)
+  data.frame(
+    PC     = pc,
+    PC_num = as.numeric(sub("PC", "", pc)),
+    dist   = d_seq,
+    cor    = co["A"] * exp(-d_seq / co["lambda"])
+  )
+}))
+
+
+pc_levels <- as.numeric(sub("PC", "", pcs))                 ### 1, 18, 24
+pc_colours <- scales::gradient_n_pal(scales::viridis_pal()(6))(
+  scales::rescale(pc_levels, from = c(1, 24))               ### Colours taken from a viridis scale spanning PC1 to PC24
+)
+names(pc_colours) <- pcs                                       
+
+
+
+
+within_df <- between_df %>%
+  distinct(PC, PC_num, dist_within, cor_within)
+between_df$gap_dist <- between_df$gap * z_per_slice
+
+plot_to_save <- ggplot(within_df, aes(x = dist_within, y = cor_within, group = PC, colour = PC)) +
+  geom_line(linewidth = 1.4,alpha=0.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.6) +
+  scale_colour_manual(
+    name   = "PC",
+    values = pc_colours,
+    breaks = pcs,                                   # keeps legend order PC1, PC18, PC24
+    guide  = guide_legend(override.aes = list(
+      linetype = 0, shape = 16, size = 3, alpha = 1 # circles only in the legend
+    ))
+  ) +
+  geom_point(data=between_df,aes(dist_gap,cor_gap,group = interaction(PC, gap),colour = PC,shape = as.factor(gap * z_per_slice)),size=0.4,alpha = 0.9) +
+  theme_minimal(base_size = 10) +
+  labs(
+    x = "Distance (μm)",
+    y = "Correlation"
+  ) +    ggnewscale::new_scale_colour() +
+geom_line(data = fit_df, aes(dist, cor,group=PC,colour = "Exponential fit"),
+          inherit.aes = FALSE, linetype = "dashed",linewidth = 0.8, alpha = 0.35) +
+  scale_shape_discrete(name = "Gap distance (µm)") +
+  scale_colour_manual(name = NULL,values = c("Exponential fit" = "red")) +
+    theme(
+    panel.grid.minor = element_line(color = "gray90", linetype = "solid",linewidth = 0.12),
+    panel.grid.major = element_line(color = "gray80", linetype = "solid",linewidth = 0.23)
+  ) 
+  
+
+
+
+
+# Extract the legend
+legend <- get_legend(plot_to_save)
+
+
+
+# Remove legend from main plot
+plot_to_save_no_legend <- plot_to_save + theme(legend.position = "none")
+ggsave("Data/Fig_IMC_curve.svg", plot = plot_to_save_no_legend,
+       width = 3, height = 2, units = "in",
+       dpi = 300)  
+
+
+ggsave("Data/Fig_IMC_curves_legend.svg", plot = legend,
+       width = 2, height = 3.5, units = "in",
+       dpi = 300)  
+```
+
+
+### 8. Spatial map of PC21 across stacked slices Fig 3. A
+```{r}
+# Plot PC21 around four representative z-planes, including ±2 neighbouring planes.
+df$slice    <- as.numeric(as.character(df$slice))
+pcs_to_plot <- c("PC21")
+z_centers   <- c(60, 70, 80, 90)
+half        <- 2
+cols        <- colorRampPalette(c("#FFFFFF", "#08306B"))(100)   # same as seqFISH
+bar_len     <- 100                                             # µm
+
+
+
+
+for (map_pc in pcs_to_plot) {
+  plot_data <- data.frame()
+
+  for (zc in z_centers) {
+
+    keep_rows <- df$slice >= (zc - half) & df$slice <= (zc + half)
+    cells     <- df[keep_rows, ]
+
+    label <- paste0("slice ", zc, " (±", half, ")")
+
+    one_panel <- data.frame(
+      x     = cells$centroid_x,
+      y     = cells$centroid_y,
+      score = cells[[map_pc]],
+      panel = label
+    )
+
+    plot_data <- rbind(plot_data, one_panel)
+  }
+
+  panel_order     <- paste0("slice ", z_centers, " (±", half, ")")
+  plot_data$panel <- factor(plot_data$panel, levels = panel_order)
+
+
+  ### scale bar setup 
+  x0 <- min(plot_data$x) + 10
+  y0 <- min(plot_data$y) - 20
+  lab_df <- data.frame(x = x0 + bar_len + 10, y = y0,
+                       label = paste(bar_len, "\u00b5m"),
+                       panel = factor(tail(panel_order, 1), levels = panel_order))
+  
+  my_plot <- ggplot(plot_data, aes(x = x, y = y, color = score)) +
+    geom_point(size = 0.5, alpha = 0.8) +
+     annotate("segment", x = x0, xend = x0 + bar_len, y = y0, yend = y0,
+             colour = "white", linewidth = 1) +
+    geom_text(data = lab_df, aes(x, y, label = label), inherit.aes = FALSE,
+              colour = "white", size = 3, hjust = 0) +
+    coord_fixed() +
+    facet_wrap(~ panel, nrow = 2) +
+  scale_colour_gradientn(colours = cols, limits = c(-0.3,0.3),name = "PC21 score",oob = scales::squish,
+    guide = guide_colourbar(
+    direction = "vertical",
+    barheight = unit(4, "cm"),
+    barwidth  = unit(0.3, "cm"),
+    ticks.colour = "white",
+    frame.colour = "white",
+    title.position = "right"
+  )) +
+    theme_minimal(base_size = 10) +
+    theme(panel.grid = element_blank()) +
+    labs(x = "x (um)", y = "y (um)") +
+       theme(panel.background = element_rect(fill = 'black'), 
+             panel.grid.major = element_blank(),
+             panel.grid.minor = element_blank(),
+             panel.border = element_rect(color = "red"),
+             axis.text = element_blank(),
+             axis.ticks = element_blank(),
+             axis.title = element_blank(),
+             strip.text = element_text(colour = "white",size = 10),
+             plot.margin=unit(c(0.25,0,0.25,0), 'cm'),
+             plot.background = element_rect(fill = "black", colour = NA),
+             plot.title = element_text(colour = "white",size = 10),
+               legend.text = element_text(colour = "white"),
+               legend.box.spacing = unit(0.1, "cm"),
+  legend.title = element_text(colour = "white",angle=270),
+  legend.background = element_rect(fill = "black", colour = NA),
+  legend.key = element_rect(fill = "black", colour = NA)) 
+  print(my_plot)
+    legend_version <- my_plot +
+    theme(
+      legend.text       = element_text(colour = "black"),
+      legend.title      = element_text(colour = "black", angle = 270),
+      legend.background = element_rect(fill = "white", colour = NA),
+      legend.key        = element_rect(fill = "white", colour = NA)
+    ) +
+    guides(colour = guide_colourbar(
+      direction = "vertical",
+      barheight = unit(4, "cm"),
+      barwidth  = unit(0.3, "cm"),
+      ticks.colour = "black",
+      frame.colour = "black",   # otherwise the white end of the bar blends into the page
+      title.position = "right"
+    ))
+
+  imc_overlay_legend <- get_legend(legend_version)
+  my_plot_no_legend  <- my_plot + theme(legend.position = "none")
+  
+  ggsave(paste0("Data/Fig_imc_stacked_slice_map", map_pc, ".svg"), my_plot_no_legend, width = 3.5, height = 2.5, dpi = 300)
+  ggsave(paste0("Data/Fig_imc_stacked_slice_map_legend", map_pc, ".svg"), imc_overlay_legend, width = 1, height = 3, dpi = 300)
+}
+
+print(my_plot)
+```
+
+
+

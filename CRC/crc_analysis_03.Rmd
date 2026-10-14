@@ -1,0 +1,1055 @@
+---
+title: "0_3_CRC"
+output: html_document
+date: "2026-08-07"
+---
+### Script for Analysis of CyCIF CRC dataset for "Are low-variance Principal Components of single-cell omics data biologically meaningful, or just noise?"
+### Data source. 
+# https://www.cell.com/cell/fulltext/S0092-8674(22)01571-9
+#### cell tables:  (Sardana_CRC_46.csv Sardana_CRC_47.csv) were generated with the scripts in the t-CyCIF ImageJ/MATLAB pipeline(https://github.com/sorgerlab/cycif) repo
+### Quality control; PCA on 24 tumor markers (section 47); mean marker intensity of the 40 nearest non-epithelial cells (section 46); CCA; permutation test; Multivariate regression; figure panels.
+### Inputs: mmc3.xlsx  Sardana_CRC_46.csv Sardana_CRC_47.csv
+### Outputs: panels for figure 4.
+
+
+### Library 
+```{r}
+library(tidyverse)
+library(RANN)   
+library(zoo)
+library(readxl)
+
+###plotting
+library(ggplot2)
+library(cowplot)
+library(pheatmap)
+library(svglite)
+library(reshape2)
+library(grid)
+```
+
+
+
+### Functions
+```{r}
+### Summary function   
+print_cv_summary <- function(xload, yload, cca_cors, n_pc, label) {
+  # xload: correlations between tumor PC scores and tumor-side CV scores, U.
+  # yload: correlations between immune-neighborhood markers and neighborhood-side CV scores, V.
+  # cca_cors: canonical correlation for each CV, cor(U, V).
+  # n_pc: number of tumor PCs.
+  # label: name printed above this CCA result.
+  
+  
+  cat(paste0("\n=== ", label, " ===\n\n")) 
+  n_cv <- length(cca_cors)   
+ 
+   for (cv in 1:n_cv) { 
+    loads <- xload[, cv]  # Tumor PC loading for this tumor-side CV score.
+    
+    contrib <- loads^2 / sum(loads^2) ### Square PC loadings and normalize them to sum to 1 to obtain the relative squared-loading composition of each CV.
+    names(contrib) <- paste0("PC", 1:n_pc)
+    
+    top5 <- sort(contrib, decreasing = TRUE)[1:5]  ### Top 5 pcs by normalized squared loading.
+    #PCs 9–24 are the low-variance group (each ≤ 2.4% of variance)
+    early <- round(sum(contrib[1:8]) * 100, 1)  ### Percentage of normalized squared PC-loading magnitude from PCs 1-8.
+    late <- round(sum(contrib[9:n_pc]) * 100, 1) ### Percentage of normalized squared PC-loading magnitude from PCs 9-n_pc.
+    
+    imm_loads <- yload[, cv] ### Correlation of each neighborhood marker with the neighborhood-side CV score
+    top_idx <- order(abs(imm_loads), decreasing = TRUE)[1:3]
+    imm_top3 <- imm_loads[top_idx]  ### Top immune markers.
+    ### Print out results. 
+    cat(sprintf("CV%d (r=%.3f) | Early: %.1f%% Late: %.1f%% | Top PCs: %s | Top immune: %s\n",
+                cv, cca_cors[cv], early, late,
+                paste(names(top5), sprintf("%.1f%%", top5*100), sep="=", collapse=", "),
+                paste(names(imm_top3), sprintf("%.2f", imm_top3), sep="=", collapse=", ")))
+  }
+}
+
+
+### Run CCA and return loading.
+run_cca <- function(pca_obj, neighborhood_df, pc_cols_use) { 
+  reg <- data.frame(pca_obj$x[, 1:length(pc_cols_use)]) ### Extract selected tumor PC scores.
+  colnames(reg) <- pc_cols_use 
+  reg[pc_cols_use] <- scale(reg[pc_cols_use]) ###scale the pc scores such that each PC is standardized to unit variance before CCA so high-variance  PCs do not dominate solely because of their high variance
+  
+  Y <- as.matrix(neighborhood_df[, -1]) #### drop tumor cell id from means 
+  X <- as.matrix(reg[, pc_cols_use])   
+  
+  cca_out <- cancor(X, Y) ###CCA between tumor cells PC scores and immune means 
+  
+  X_c <- scale(X, center = TRUE, scale = FALSE)  
+  Y_c <- scale(Y, center = TRUE, scale = FALSE) 
+  U <- X_c %*% cca_out$xcoef ### Calculate tumor-side canonical scores (U). 
+  V <- Y_c %*% cca_out$ycoef ### Calculate neighborhood-side canonical scores (V). 
+
+  ### Calculate canonical loading as correlations between input variables and canonical scores.
+  xload <- cor(X, U) 
+  yload <- cor(Y, V)
+  ### Return CCA results, loading, and canonical scores. 
+  list(cca = cca_out, xload = xload, yload = yload, U = U, V = V)
+}
+
+
+###significance test, sub sample x side and shuffle y side 
+
+sig_test_shuffle <- function(
+  seed, ### Random seed.
+  n_perm, ### Number of permutations.
+  n_sub,  ### Number of cells in the sub sample.
+  pca_res, ### Tumor PCA object.
+  nbr_data, ## Section 46 non-epithelial cells: marker intensities and Xt, Yt coordinates
+  tumor_coords, #### Tumor-cell spatial coordinates.
+  immune_cols_CCA,  ### the cols to take the means of 
+  nbr_means         ### precalced nbr means to do baseline CCA 
+  
+) {
+
+  ### set seed for reproducibility  
+  set.seed(seed)
+
+  ### z score the x side scores 
+  X_scores <- as.matrix(scale(pca_res$x))
+  
+  tumor_coords <- tumor_coords[, c("Xt", "Yt")]
+  
+  ### get the non mean section 46 intensity data 
+  S_46_markers <- nbr_data[,immune_cols_CCA]
+  ### get the non mean section coords 46 data 
+  S_46_coorads <- nbr_data[,c("Xt","Yt")]
+  
+  ### join into one DF 
+  full_46 <- bind_cols(S_46_markers,S_46_coorads)
+  
+  ### check they all match up 
+  stopifnot(
+    nrow(X_scores) == nrow(tumor_coords),
+    nrow(X_scores) == nrow(nbr_means),
+    n_sub <= nrow(X_scores),
+    all(immune_cols_CCA %in% colnames(nbr_data)),
+    all(immune_cols_CCA %in% colnames(nbr_means))
+  )
+  
+  #### baseline sampled CCA to compare the null too 
+  ### Sub sample cells.
+  sub_idx <- sample(seq_len(nrow(X_scores)), n_sub)
+  
+  ### get the  NBR means values
+  Y_perm <- as.matrix(nbr_means[, immune_cols_CCA])
+  
+  ### get the matching PC scores (scaled) from the subset 
+  X_sub <- X_scores[sub_idx, , drop = FALSE]
+  
+  ### get the matching tumor coordinates from the subset
+  tumor_coords_sub <- tumor_coords[sub_idx, , drop = FALSE]
+  ### get the NBR means the correspond to the sampled X cells 
+  Y_sub <- Y_perm[sub_idx, , drop = FALSE]
+  
+  
+  
+  ### Observed CCA on the sub sample.
+  obs_sub <- cancor(X_sub, Y_sub)$cor
+   
+  ##storage for the null cors 
+  null_cors_block <- matrix(
+      NA_real_,
+      nrow = n_perm,
+      ncol = length(obs_sub)
+    )
+  
+  
+  ### get the marker values for section 46 
+  full_46_markers_only <- full_46 %>% select(-Xt,-Yt)
+  ### the X and Y values for the y side (section 46)
+  X_Y_to_shuffle <- cbind(full_46$Xt,full_46$Yt)
+  
+  
+  ### start the perm loop
+  for (i in seq_len(n_perm)) {
+    ### shuffle the Y side coords, so each cell now has a diff X and Y 
+    X_Y_shuffled <- X_Y_to_shuffle[sample(1:nrow(X_Y_to_shuffle)),]
+    
+    full_46_markers_only_shuffled_coords <- full_46_markers_only
+    
+    full_46_markers_only_shuffled_coords$Xt_shuff <- X_Y_shuffled[,1]
+    full_46_markers_only_shuffled_coords$Yt_shuff <- X_Y_shuffled[,2]
+    
+    ### Identify nearest neighbors in registered spatial coordinates. Using all Y cells but sampled X cells, so now each x cell has 40 nn Neighbors that have been shuffled 
+    nn_nonepi_shuffled <- nn2(
+      data  = full_46_markers_only_shuffled_coords[, c("Xt_shuff", "Yt_shuff")], #### Reference cells: non-epithelial cells from section 46
+      query = tumor_coords_sub[, c("Xt", "Yt")], ### Query cells: tumor cells from section 47.
+      k = 40 ### Number of nearest neighbors.
+    )
+    
+    ###find means 
+    ##so  each of the sampled X cells will have the mean values of markers from shuffled cells 
+    nbr_means_shuffled <- data.frame(tumor_cell = 1:nrow(X_sub))
+    
+    for (col in immune_cols_CCA) {
+      nbr_means_shuffled[[col]] <- apply(nn_nonepi_shuffled$nn.idx, 1, function(idx) {
+        mean(full_46_markers_only_shuffled_coords[[col]][idx])
+      })
+    }
+    ### run CCA comparing the sampled X cells PC values to the shuffled means 
+    null_cors_block[i,] <- cancor(X_sub, as.matrix(nbr_means_shuffled[, immune_cols_CCA]))$cor
+    
+    
+    ###print out progress every 100 permutations.
+      if (i %% 100 == 0) {
+        cat("Permutation", i, "/", n_perm, "\n")
+        }
+  
+  ### end of perm loop 
+  }
+    # Summary table
+    perm_sig <- data.frame(
+      CV = seq_along(obs_sub), ### CV number 
+  
+      r_sub = round(obs_sub, 4), ### Observed canonical correlations in the subsample 
+  
+      null_mean = round(colMeans(null_cors_block), 4),  ### Mean null canonical correlation for each CV.
+  
+      null_95 = round(apply(null_cors_block, 2, quantile, 0.95), 4),####95th percentile of the null distribution for each CV
+  
+      ratio = round(obs_sub / colMeans(null_cors_block), 1), ### Ratio of observed to mean null canonical correlation.
+      p_value = sapply(seq_along(obs_sub), function(j) {   # p val 
+        ( sum(null_cors_block[, j] >= obs_sub[j])) / (n_perm) })
+    
+      )
+    ### BH correction 
+  perm_sig$p_adj <- p.adjust(perm_sig$p_value, method = "BH")
+    
+    print(perm_sig)
+  
+    cat("\nSignificant CVs (p < 0.05):", sum(perm_sig$p_value < 0.05),"\n" )
+  
+    cat("Significant CVs (BH-adjusted p < 0.05):", sum(perm_sig$p_adj < 0.05), "\n")
+  
+    # Return everything required for summaries and plots
+    list(
+      results = perm_sig,
+      null_cors = null_cors_block,
+      observed = obs_sub,
+      sample_indices = sub_idx,
+      coords = tumor_coords_sub
+    )
+}
+
+### plotting functions 
+
+# SVG device: map generic sans font to Arial
+### Save Plot as SVG 
+arial_svg <- function(filename, width, height, ...) {
+  svglite::svglite(
+    file = filename,
+    width = width,   ### Width of output
+    height = height, ### height of output
+    system_fonts = list(
+      sans = "Arial"   ###make text Arial
+    ),
+    ...)
+}
+### Order and group marker weights per CV
+
+order_markers_by_cv <- function(coef_mat) {
+  best_cv <- apply(abs(coef_mat), 1, which.max) ### In which CV column does a marker have its largest absolute coefficient.
+  best_val <- apply(abs(coef_mat), 1, max)     ### For each marker, grab that largest absolute coefficient for sorting.
+
+  ord <- order(best_cv, -best_val) ### Sorts first by assigned CV (highest abs weight), then within assigned CV.
+
+  gaps <- cumsum(table(best_cv[ord])) ### Cumulative row positions where each CV group ends, tells pheatmap where to draw gaps.
+  gaps <- gaps[-length(gaps)]       
+
+  annot <- data.frame(   
+    CV = paste0("CV", best_cv[ord]),
+    row.names = rownames(coef_mat)[ord])
+
+  list(
+    order = ord,
+    gaps = gaps,
+    annotation = annot)
+}
+
+
+
+```
+
+
+
+
+### Setup. 
+```{r}
+
+panel_path <- file.path("Data/mmc3.xlsx")    #### Marker-panel reference file.
+
+csv_dir    <- file.path("Data/Raw_CRC_CSV") ### Raw CRC CSV directory.
+
+out_dir_plots    <- file.path("Data/Plots") ### Output directory for figure panels.
+
+dir.create(out_dir_plots, recursive = TRUE, showWarnings = FALSE) ### Create the output folder for figure panels.
+
+```
+
+## Part 1: Quality control.
+
+## Step 1: Build the channel → marker rename lookup.
+```{r}
+
+### Load the marker-panel reference table.
+raw_ref <- read_excel(panel_path, sheet = "CRC1 slices 45-47", col_names = FALSE) 
+
+colnames(raw_ref) <- c("cycle_raw", "channel", "s45", "s46", "s47")
+
+raw_ref <- raw_ref[-1, ]
+
+raw_ref$cycle_raw <- zoo::na.locf(raw_ref$cycle_raw, na.rm = FALSE)
+### Standardize fluorescence channel/cycle identifiers and map them to section-specific protein-marker names.
+ref <- raw_ref %>%
+  mutate(
+    cycle   = as.integer(str_extract(cycle_raw, "\\d+")),
+    channel = recode(channel, A488 = "FITC", A555 = "Cy3", A647 = "Cy5"),
+    csv_col = paste0(channel, "_", cycle),
+    across(c(s45, s46, s47), ~ sub("\\s*\\(.*", "", .x))
+  ) %>%
+  select(cycle, channel, csv_col, s45, s46, s47)
+```
+
+
+
+
+
+## Step 2: Read raw CSVs and rename columns. 
+```{r}
+### Read one CRC section and replace fluorescence channel/cycle column names with the corresponding protein-marker names from the panel lookup.
+rename_section <- function(sec) {
+  dat <- read.csv(file.path(csv_dir, paste0("Sardana_CRC_", sec, ".csv")))
+  ### Select the marker identities corresponding to the requested section.
+  lookup <- ref %>% select(csv_col, marker = all_of(paste0("s", sec)))
+  
+  ### Match raw channel/cycle columns (e.g., Cy3_5) to marker names.
+  idx <- match(colnames(dat), lookup$csv_col)
+  new_names <- ifelse(is.na(idx), colnames(dat), lookup$marker[idx])
+  ### if same marker was measured in more than one imaging cycle append the cycle number so the resulting name is unique
+  dupes <- unique(new_names[duplicated(new_names)])
+  if (length(dupes) > 0) {
+    for (i in seq_along(new_names)) {
+      if (new_names[i] %in% dupes & !is.na(idx[i])) {
+        cycle_num <- str_extract(lookup$csv_col[idx[i]], "\\d+$")
+        new_names[i] <- paste0(new_names[i], "_c", cycle_num)
+      }
+    }
+  }
+  ### Convert marker names to valid R column names.
+  colnames(dat) <- make.names(new_names)   
+  return(dat)
+}
+### Import and rename the two CRC sections used in downstream analysis.
+crc_46 <- rename_section("46")
+crc_47 <- rename_section("47")
+### Report dataset dimensions as a basic import check.
+cat("Section 46:", nrow(crc_46), "cells,", ncol(crc_46), "columns\n")
+cat("Section 47:", nrow(crc_47), "cells,", ncol(crc_47), "columns\n")
+
+### Correct marker annotation: antibody corresponds to FOXO1 rather than FOXA1. 
+colnames(crc_47)[colnames(crc_47) == "FOXA1"] <- "FOXO1"
+```
+
+
+
+## Step 3: Drop bad channels.
+
+### Channels dropped for quality reasons (staining artefacts, poor signal quality, or late-cycle tissue loss).
+
+```{r}
+### Marker channels excluded for quality reasons.
+bad_46 <- c("PAX5", "POLR2A", "NFATc1", "PAX8", "pBTK", "VEGFR2","CD11a","CD16","CD1a","CD57") 
+bad_47 <- c("EZH2", "pCDK", "E2F1", "FOXA2", "CD20","SMA_c9","SMA_c10","H3","NCR1") 
+
+crc_46 <- crc_46[, !colnames(crc_46) %in% bad_46]
+crc_47 <- crc_47[, !colnames(crc_47) %in% bad_47]
+
+cat("Section 46: dropped", length(bad_46), "bad channels →", ncol(crc_46), "columns\n")
+cat("Section 47: dropped", length(bad_47), "bad channels →", ncol(crc_47), "columns\n")
+```
+
+
+
+
+### Step 4: Filter cells with zero intensity in any marker channel.
+
+### Cells with zero intensity in any retained marker channel were excluded as potential technical failures, including tissue loss.
+
+```{r}
+### Select marker-intensity columns after bad-channel removal.
+### Secondary-antibody channels are excluded from the zero-intensity filter.
+
+### Identify marker columns used for zero-intensity filtering.
+get_marker_cols <- function(dat, start, end) {
+  cols <- colnames(dat)[start:end]
+  cols[!grepl("anti", cols)]
+}
+
+marker_46 <- get_marker_cols(crc_46, 15, 46)
+marker_47 <- get_marker_cols(crc_47, 15, 47)
+
+### Identify cells with zero intensity in any retained marker.
+has_zero_46 <- apply(crc_46[marker_46], 1, function(x) any(x == 0))
+has_zero_47 <- apply(crc_47[marker_47], 1, function(x) any(x == 0))
+
+### Remove cells containing zero-intensity marker measurements.
+crc_46 <- crc_46[!has_zero_46, ]
+crc_47 <- crc_47[!has_zero_47, ]
+
+### Report the number of excluded cells.
+cat("Section 46: removed", sum(has_zero_46), "cells with zeros →", nrow(crc_46), "cells\n")
+cat("Section 47: removed", sum(has_zero_47), "cells with zeros →", nrow(crc_47), "cells\n")
+```
+
+
+
+### Step 5: Filter cells with unstable Hoechst signal across cycles. 
+### Cells with high CV across the 14 Hoechst measurements may have experienced tissue loss or photobleaching in later cycles. Cells with unusually low CV may indicate segmentation artifacts. 
+### We exclude cells beyond ±3 SD of the mean CV.
+
+```{r}
+### Hoechst intensity columns measured across imaging cycles.
+hoechst_cols <- paste0("Hoechst_", 1:14)
+
+### Section 46   
+
+### Calculate the coefficient of variation (CV) of Hoechst intensity  across the 14 measurements for each cell.
+cv_46 <- apply(crc_46[hoechst_cols], 1, function(x) sd(x) / mean(x))
+
+
+### Define outlier thresholds as 3 SD above or below the mean Hoechst CV.
+upper_46 <- mean(cv_46) + 3 * sd(cv_46)
+lower_46 <- mean(cv_46) - 3 * sd(cv_46)
+
+
+### Report the number of cells outside the CV thresholds.
+cat("S46 — above upper:", sum(cv_46 > upper_46), "\n")
+cat("S46 — below lower:", sum(cv_46 < lower_46), "\n")
+cat("S46 — total flagged:", sum(cv_46 > upper_46 | cv_46 < lower_46), "\n")
+
+### Repeat the Hoechst CV calculation and outlier detection for section 47.
+cv_47 <- apply(crc_47[hoechst_cols], 1, function(x) sd(x) / mean(x))
+upper_47 <- mean(cv_47) + 3 * sd(cv_47)
+lower_47 <- mean(cv_47) - 3 * sd(cv_47)
+
+### Report the number of cells outside the CV thresholds.
+
+cat("S47 — above upper:", sum(cv_47 > upper_47), "\n")
+cat("S47 — below lower:", sum(cv_47 < lower_47), "\n")
+cat("S47 — total flagged:", sum(cv_47 > upper_47 | cv_47 < lower_47), "\n")
+
+### Flag cells whose Hoechst CV lies outside the section-specific ±3 SD range.
+cv_flag_46 <- cv_46 > upper_46 | cv_46 < lower_46
+cv_flag_47 <- cv_47 > upper_47 | cv_47 < lower_47
+```
+
+
+
+### Step 6: Apply Hoechst CV filter to filter cells beyond ±3 SD of the mean CV.
+```{r}
+### Remove cells flagged by the Hoechst CV filter.
+CV_drop_46 <- cv_flag_46
+CV_drop_47 <- cv_flag_47 
+crc_46 <- crc_46[!CV_drop_46, ]
+crc_47 <- crc_47[!CV_drop_47, ]
+
+cat("Section 46: removed", sum(CV_drop_46), "cells (CV) →", nrow(crc_46), "cells\n")
+cat("Section 47: removed", sum(CV_drop_47), "cells (CV) →", nrow(crc_47), "cells\n")
+```
+
+
+
+
+### Step 7: Log-transform marker intensities to reduce skew in marker-intensity distributions.
+
+### log1p (log(1+x)) is used to accommodate small non-negative intensity values.
+```{r}
+### Recalculate marker cols after filtering
+marker_46 <- get_marker_cols(crc_46, 15, 46)
+marker_47 <- get_marker_cols(crc_47, 15, 47)
+
+crc_46[marker_46] <- log1p(crc_46[marker_46])
+crc_47[marker_47] <- log1p(crc_47[marker_47])
+
+cat("Log-transformed", length(marker_46), "markers on section 46\n")
+cat("Log-transformed", length(marker_47), "markers on section 47\n")
+```
+
+
+
+
+### Part 2: CCA analysis.
+
+### Step 1: ROI and region exclusion.
+
+### ROI-1 excluded for being non-cancerous normal colon mucosa.
+
+```{r}
+# Remove ROI 1 (normal mucosa).
+filter_region <- function(dat) {
+  dat %>%
+    filter(ROI != 1) 
+}
+
+
+###drop cells tagged with roi 1.
+crc_46_filtered <- filter_region(crc_46)
+crc_47_filtered <- filter_region(crc_47)
+
+cat("S46:", nrow(crc_46), "→", nrow(crc_46_filtered), "after region exclusion\n")
+cat("S47:", nrow(crc_47), "→", nrow(crc_47_filtered), "after region exclusion\n")
+```
+
+
+### Step 2: Label cells 
+
+### Different epithelial markers were used because the two sections contained different staining panels.
+
+###Section 46: Epithelial gating  
+
+### PanKeratin threshold (5.2) was selected from the bimodal distribution of log1p-transformed PanKeratin intensity to classify epithelial cells.
+```{r}
+crc_46_gated <- crc_46_filtered %>%
+  mutate(is_epi = panKeratin > 5.2 ) ### Classify PanKeratin-high cells as epithelial.
+```
+
+
+
+
+
+
+### Section 47: Tumor gating
+
+### E-cadherin threshold (6.8) was selected from the bimodal distribution of log1p-transformed E-cadherin intensity to identify tumor epithelial cells.
+```{r}
+ecad_threshold <- 6.8
+
+
+tumor_47 <- crc_47_filtered %>% filter(E.cadherin > ecad_threshold) ### Retain E-cadherin-high cells as tumor epithelial cells.
+```
+
+
+
+
+### Step 3: PCA on tumor cells.
+
+#### PCA was used on log1p-transformed tumor-marker intensities to summarize correlated tumor-marker intensities into orthogonal components ordered by the amount of variation captured across tumor cells.
+
+
+### Marker intensities were mean-centered but not variance-scaled before PCA, so differences in variance among markers were retained.
+
+```{r}
+## PCA on tumor cells with relevant markers 
+pca_markers <- c("RPA32", "SDHB", "NP.Catenin", "EGFR", "Bax", "MucinAC",
+                  "cJUN", "LaminB1", "BRAFV600E", "Notch1", "pTBK1", "pH3",
+                  "TriMeH3", "FOXO1", "E.cadherin", "KAP1", "S100A4",
+                  "COXIV", "cCasp3", "Survivin", "p53", "ERBB2", "NGFR", "mTOR")
+### Verify that all selected markers are present.
+stopifnot(all(pca_markers %in% colnames(tumor_47)))
+
+
+pca_result_47 <- prcomp(tumor_47[pca_markers], center = TRUE, scale. = F) ### Mean-center markers without variance scaling.
+
+### Calculate the fraction of variance explained by each PC. 
+var_explained<- pca_result_47$sdev^2 / sum(pca_result_47$sdev^2)
+round(var_explained * 100, 1)
+```
+
+
+
+### Step 4: Nearest-neighbour mapping.
+
+### Sections 46 and 47 have previously been spatially registered, so Xt and Yt coordinates are expressed in the same coordinate system.
+
+### For each tumor cell in section 47, the 40 nearest non-epithelial cells in registered section 46 were identified using Xt and Yt coordinates.
+
+### k=40 nearest non-epithelial neighbors selected as a balance between spatial resolution and stable CCA estimates.
+
+```{r}
+### Filter out cells labeled as epithelial
+crc_46_nonepi <- crc_46_gated %>% filter(!is_epi)
+
+### Identify nearest neighbors in registered spatial coordinates.
+nn_nonepi <- nn2(
+  data  = crc_46_nonepi[, c("Xt", "Yt")], #### Reference cells: non-epithelial cells from section 46
+  query = tumor_47[, c("Xt", "Yt")], ### Query cells: tumor cells from section 47.
+  k = 40 ### Number of nearest neighbors.
+)
+```
+
+
+
+### Step 5: Calculate the mean log-transformed marker intensities of the NN.
+
+### For each tumor cell, the mean log1p-transformed marker intensity was calculated across its 40 nearest non-epithelial cells to summarize the local non-epithelial microenvironment.
+
+```{r}
+### Neighborhood markers analyzed in section 46. 
+immune_cols <- c("CD3", "CD4_c3", "CD8a", "CD45", "CD68", "CD163",
+                 "CD11c", "CD11b", "IBA1", "GranB", "CD14_c3",
+                 "PD.1", "HLA.A", "CD31", "PD.L1_c5")
+
+
+nbr_mean_nonepi <- data.frame(tumor_cell = 1:nrow(tumor_47)) ### Initialize one neighborhood-summary row per tumor cell.
+
+### Calculate the mean log1p-transformed intensity of each marker across the 40 nearest non-epithelial cells.
+for (col in immune_cols) { 
+  nbr_mean_nonepi[[col]] <- apply(nn_nonepi$nn.idx, 1, function(idx) { 
+    mean(crc_46_nonepi[[col]][idx])
+  })
+}
+
+```
+
+### Step 6: Run CCA
+
+### CCA was used to identify paired linear combinations of tumor PC scores and neighborhood marker intensities that show maximal correlation across cells
+
+### All 24 tumor PCs were used on the tumor side, and mean intensities of the selected non-epithelial neighborhood markers were used on the neighborhood side.
+
+### PC scores were z-scored before CCA.
+
+```{r}
+pc_cols_24 <- paste0("PC", 1:24)
+
+###run CCA
+res_ne_47    <- run_cca(pca_result_47, nbr_mean_nonepi, pc_cols_24)
+
+####print summary 
+print_cv_summary(res_ne_47$xload,  res_ne_47$yload,  res_ne_47$cca$cor,  24, "MEAN INTENSITY — NON-EPI")
+
+```
+
+### step 7: Significance tests 
+
+### permutations were used to generate a null distribution
+
+### For a 10,000-cell subsample of tumor cells, the coordinates of the section 46 non-epithelial cells are shuffled and the neighborhood means recomputed, 500 times
+```{r}
+sig_test_shuffle(seed = 42,  ### seed for reproducibility 
+                 n_perm = 500, ### number of permutations 
+                 n_sub = 10000,   ### number of cells to sub sample 
+                 pca_res = pca_result_47,   ### pca results 
+                 nbr_data =crc_46_nonepi,   ### NBR marker values and coords
+                 tumor_coords = tumor_47[, c("Xt", "Yt")],  ### tumor (section 47) coords 
+                 immune_cols_CCA = immune_cols,            ### string vector of immune cols for CCA 
+                 nbr_means =  nbr_mean_nonepi )            ### base line NN means for baseline sampled CCA 
+
+
+```
+
+
+
+### Step 8: Multivariate regression.
+
+### Tumor and neighborhood-side canonical variate scores were regressed on z-scored marker intensities to express each canonical variate in standardized marker space.
+
+### Each coefficient is that marker's weight in the CV score with the other markers held fixed
+
+```{r}
+CV_U_for_lm <- res_ne_47$U ### Extract tumor-side canonical scores.
+
+tumor_47_for_lm_scaled <- scale(tumor_47[pca_markers]) ### Z-score tumor-marker intensities.
+
+
+CV_U_for_lm_fit <- lm(CV_U_for_lm ~ tumor_47_for_lm_scaled) ### Fit multivariate regression models for tumor-side CV scores.
+
+coefs_U <- CV_U_for_lm_fit$coefficients[-1, 1:6]  # drop intercept, keep CV1-6 weights 
+
+### rename 
+### The first six CVs are shown in Figure 4
+colnames(coefs_U) <- paste0("CV", 1:6) 
+rownames(coefs_U) <- pca_markers
+
+
+
+### Repeat for neighborhood-side canonical scores.
+CV_V_for_lm <- res_ne_47$V ##get NN side score 
+
+imunne_for_lm_scaled <- scale(nbr_mean_nonepi[,-1]) ### Z-score neighborhood marker means. 
+
+
+CV_V_for_lm_fit <- lm(CV_V_for_lm ~ imunne_for_lm_scaled) ### Fit multivariate regression models for neighborhood-side CV scores.
+
+coefs_V <- CV_V_for_lm_fit$coefficients[-1, 1:6]  # drop intercept, keep CV1-6
+###rename 
+colnames(coefs_V) <- paste0("CV", 1:6)
+rownames(coefs_V) <- immune_cols
+
+```
+
+
+
+
+
+### Part 3: Figure panels
+### Figure 4 A
+```{r}
+# Plot 1: PC composition.
+
+### Extract tumor PC loading for the first 15 CVs.
+pc_loads <- res_ne_47$xload[, 1:15]  
+
+## Convert squared PC loading to percentage composition within each CV.
+contrib <- apply(pc_loads^2, 2, function(x) x / sum(x)) * 100 
+colnames(contrib) <- paste0("CV", 1:15)
+rownames(contrib) <- paste0("PC", 1:24)
+
+###reshape data for plotting.
+pc_pct_long <- reshape2::melt(contrib)
+colnames(pc_pct_long) <- c("PC", "CV", "pct")
+pc_pct_long$PC <- factor(pc_pct_long$PC, levels = rev(paste0("PC", 1:24)))
+pc_pct_long$CV <- factor(pc_pct_long$CV, levels = paste0("CV", 1:15))
+max_pct <- max(c(contrib, var_explained * 100))
+pc_pct_long_plot <- pc_pct_long %>% 
+  filter(CV %in% paste0("CV",1:6))
+
+
+###make plot. 
+p_pc_with_legend <- ggplot(pc_pct_long_plot,aes(x = CV, y = PC, fill = pct)) +
+  geom_tile(color = "white",linewidth = 0.3,width = 1) +
+  geom_hline( yintercept = 16.5,linewidth = 0.4) +
+  scale_fill_gradient(low = "#F0F0F0",high = "#B2182B",name = "%",limits = c(0, max_pct)) +
+  guides(
+    fill = guide_colorbar(
+      title = "%",
+      title.position = "top",
+      title.hjust = 0.5,
+      barheight = grid::unit(1.5, "cm"),
+      barwidth = grid::unit(0.3, "cm"))) +
+  labs(title = "PC Composition",x = NULL,y = NULL) +
+  theme_minimal(base_size = 8, base_family = "sans") +
+  theme( 
+    plot.title = element_text(family = "sans", size = 8, hjust = 0.5,face = "bold"),
+    panel.grid = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.text.x = element_text(family = "sans", size = 8, angle = 0),
+    legend.position = "right",
+    legend.title = element_text(family = "sans", size = 8, hjust = 0.5, margin = margin(b = 3)),
+    legend.text = element_text( family = "sans", size = 8),
+    text = element_text(family = "sans", size = 8)
+    )
+
+
+### Extract the shared percentage color legend.
+pct_legend <- cowplot::get_legend(p_pc_with_legend +
+    theme(legend.position = "right"))
+
+# Main PC plot without legend.
+p_pc <- p_pc_with_legend +
+  theme(legend.position = "none")
+
+# Preview
+
+print(p_pc)
+
+grid::grid.newpage()
+grid::grid.draw(pct_legend)
+
+pc_names <- colnames(pca_result_47$x)
+
+var_explained_plot <- tibble(
+  PC = factor(pc_names, levels = rev(pc_names)),
+  variance_explained = as.numeric(var_explained)
+  )
+
+# Plot 2: Variance explained (convert to same % scale).
+var_explained_plot$pct <- var_explained_plot$variance_explained * 100
+
+p_var <- ggplot(var_explained_plot, aes(x = "", y = PC, fill = pct)) +
+  geom_tile(color = "white", width = 0.5,linewidth = 0.3 ) +
+  scale_fill_gradient(low = "#F0F0F0", high = "#B2182B", name = "%", limits = c(0, max_pct)) +
+  labs(title = NULL, x = NULL, y = NULL) +
+  theme_minimal() +
+  theme(panel.grid = element_blank(), 
+        legend.position = "none",
+        axis.text.y =element_blank(),
+        ) +
+  geom_hline(yintercept = 16.5)
+print(p_var)
+
+### Save SVG files for import into Inkscape.
+ggsave(
+  filename = file.path(out_dir_plots, "p_pc.svg"),
+  plot = p_pc,
+  width = 1.9,
+  height = 3,
+  units = "in",
+  device = svglite::svglite
+)
+
+ggsave(
+  filename = file.path(out_dir_plots, "p_var.svg"),
+  plot = p_var,
+  width = 0.5,
+  height = 2.9,
+  units = "in",
+  device = svglite::svglite
+)
+
+ggsave(
+  filename = file.path(out_dir_plots, "pct_legend.svg"),
+  plot = pct_legend,
+  width = 1.25,
+  height = 2.5,
+  units = "in",
+  device = svglite::svglite
+)
+```
+
+
+
+
+
+### Generate marker-weight heatmaps grouped by strongest CV association.
+### Figure 4B
+```{r}
+cv_colors <- list(
+  CV = c(
+    CV1 = "#E41A1C",
+    CV2 = "#377EB8",
+    CV3 = "#4DAF4A",
+    CV4 = "#984EA3",
+    CV5 = "#FF7F00",
+    CV6 = "#A65628"
+    )
+)
+
+
+
+
+### Make display copies so the original matrices remain unchanged.
+coefs_U_plot <- coefs_U
+coefs_V_plot <- coefs_V
+
+rownames(coefs_V_plot) <- gsub("_c\\d+$","",rownames(coefs_V_plot))
+
+### Create ordering and annotations after renaming.
+tum_info <- order_markers_by_cv(coefs_U_plot)
+imm_info <- order_markers_by_cv(coefs_V_plot)
+
+
+cv_df <- data.frame(
+  CV = factor(paste0("CV", 1:6), levels = paste0("CV", 1:6)),
+  x = 1,
+  y = 6:1
+)
+
+cv_fill <- c(
+  CV1 = "#E41A1C",
+  CV2 = "#377EB8",
+  CV3 = "#4DAF4A",
+  CV4 = "#984EA3",
+  CV5 = "#FF7F00",
+  CV6 = "#A65628"
+)
+
+p_cv_blocks <- ggplot(cv_df, aes(x = x, y = y, fill = CV)) +
+  geom_tile(width = 0.95, height = 0.85) +
+  scale_fill_manual(values = cv_fill) +
+  scale_y_continuous(
+    breaks = 6:1,
+    labels = paste0("CV", 1:6),
+    expand = c(0, 0)
+  ) +
+  scale_x_continuous(expand = c(0, 0)) +
+  coord_fixed() +
+  theme_void() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_blank(),
+    axis.text.y = element_text(
+      size = 8,
+      family = "sans",
+      margin = margin(r = 3)
+    ),
+    axis.ticks = element_blank(),
+    plot.margin = margin(2, 2, 2, 2)
+  )
+
+
+
+```
+
+
+
+
+
+### Save heatmaps and legends
+```{r}
+
+
+shared_lim <- max(
+  abs(coefs_U_plot),
+  abs(coefs_V_plot),
+  na.rm = TRUE
+)
+
+shared_breaks <- seq(-shared_lim, shared_lim, length.out = 101)
+shared_colors <- colorRampPalette(c("#2166AC", "white", "#B2182B"))(100)
+
+
+p_tumor_weights <- pheatmap(
+  coefs_U_plot[tum_info$order, , drop = FALSE],
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  gaps_row = tum_info$gaps,
+  annotation_row = tum_info$annotation,
+  annotation_legend = FALSE,
+  annotation_colors = cv_colors,
+  color = shared_colors,
+  breaks = shared_breaks,
+  legend = FALSE,
+  main = "CV-Tumor Weights",
+  display_numbers = FALSE,
+  number_format = "%.4f",
+  fontfamily = "sans",
+  fontsize = 8,
+  fontsize_row = 8,
+  fontsize_col = 8,
+  fontsize_number = 7,
+  border_color = NA,
+  silent = TRUE,
+  angle_col = 0
+)
+
+p_immune_weights <- pheatmap(
+  coefs_V_plot[imm_info$order, , drop = FALSE],
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  gaps_row = imm_info$gaps,
+  annotation_row = imm_info$annotation,
+  annotation_legend = FALSE,
+  annotation_colors = cv_colors,
+  color = shared_colors,
+  breaks = shared_breaks,
+  legend = FALSE,
+  main = "CV-Immune Weights",
+  display_numbers = FALSE,
+  number_format = "%.4f",
+  fontfamily = "sans",
+  fontsize = 8,
+  fontsize_row = 8,
+  fontsize_col = 8,
+  fontsize_number = 7,
+  border_color = NA,
+  silent = TRUE,
+  angle_col = 0
+)
+
+
+### Exact same endpoint colours as the heatmaps.
+weight_gradient <- linearGradient(
+  colours = c("#2166AC", "white", "#B2182B"),
+  stops = c(0, 0.5, 1),
+  x1 = unit(0.5, "npc"),
+  y1 = unit(0, "npc"),
+  x2 = unit(0.5, "npc"),
+  y2 = unit(1, "npc")
+)
+
+### Match PC legend bar size: 1.5 cm high x 0.3 cm wide.
+shared_legend <- grobTree(
+
+  rectGrob(
+    x = unit(0.42, "npc"),
+    y = unit(0.5, "npc"),
+    width = unit(0.3, "cm"),
+    height = unit(1.5, "cm"),
+    gp = gpar(
+      fill = weight_gradient,
+      col = NA
+    )
+  ),
+
+  textGrob(
+    label = sprintf("%.3f", shared_lim),
+    x = unit(0.42, "npc") + unit(0.3, "cm"),
+    y = unit(0.5, "npc") + unit(0.75, "cm"),
+    just = "left",
+    gp = gpar(
+      fontsize = 8,
+      fontfamily = "sans"
+    )
+  ),
+
+  textGrob(
+    label = "0",
+    x = unit(0.42, "npc") + unit(0.3, "cm"),
+    y = unit(0.5, "npc"),
+    just = "left",
+    gp = gpar(
+      fontsize = 8,
+      fontfamily = "sans"
+    )
+  ),
+
+  textGrob(
+    label = sprintf("%.3f", -shared_lim),
+    x = unit(0.42, "npc") + unit(0.3, "cm"),
+    y = unit(0.5, "npc") - unit(0.75, "cm"),
+    just = "left",
+    gp = gpar(
+      fontsize = 8,
+      fontfamily = "sans"
+    )
+  )
+)
+
+arial_svg(
+  filename = file.path(
+    out_dir_plots,
+    "shared_weights_legend.svg"
+  ),
+  width = 1.25,
+  height = 2.5
+)
+
+grid.newpage()
+grid.draw(shared_legend)
+
+dev.off()
+
+
+
+ggsave(
+  filename = file.path(out_dir_plots, "tumor_weights.svg"),
+  plot = p_tumor_weights$gtable,
+  width = 2.5,
+  height = 3,
+  units = "in",
+  device = arial_svg,
+  bg = "transparent"
+)
+
+ggsave(
+  filename = file.path(out_dir_plots, "immune_weights.svg"),
+  plot = p_immune_weights$gtable,
+  width = 2.5,
+  height = 3,
+  units = "in",
+  device = arial_svg,
+  bg = "transparent"
+)
+
+
+
+
+p_cv_blocks
+ggsave(
+  filename = file.path(out_dir_plots, "cv_blocks_horizontal.svg"),
+  plot = p_cv_blocks,
+  width = 2.2,
+  height = 1,
+  units = "in",
+  device = arial_svg,
+  bg = "transparent"
+)
+```
+
+
