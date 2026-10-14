@@ -15,8 +15,7 @@ This repository contains the analysis code for "Are low-variance Principal Compo
     │   │   ├── pixi.lock
     │   │   └── pixi.toml
     │   └── download-images_01/
-    │       ├── .Rhistory
-    │       ├── download-htan-files_01.md
+    │    ├── download-htan-files_01.md
     │       └── gen3_manifest.json
     ├── IMC/
     │   ├── IMC_make_csv_01.py
@@ -24,7 +23,7 @@ This repository contains the analysis code for "Are low-variance Principal Compo
     ├── seqFISH/
     │   └── Seqfish_pipeline_01.Rmd
     └── Tonsil/
-        ├── 01_affine_registration.m
+        ├── affine_registration_01.m
         ├── Flat-field_correction_03.Rmd
         ├── Reorder_02.Rmd
         ├── tonsil_pipeline_04.Rmd
@@ -149,7 +148,7 @@ MATLAB R2026a (version 26.1) with Image Processing Toolbox 26.1, for affine_regi
 
 Python 3.12.10, for IMC_make_csv_01.py: tifffile 2026.9.20, pandas 3.0.6, scikit-image 0.26.0, numpy 2.5.3 (run on Windows 11)    
 
-Python, for the CRC alignment: the environment is defined in 02-align-images/pixi.toml and pixi.lock. Install pixi, then run `pixi install` in that folder. The lock file is solved for 64-bit Windows; see the README in that folder.
+Python, for the CRC alignment: the environment is defined in align-images_02/pixi.toml and pixi.lock. Install pixi, then run `pixi install` in that folder. The lock file is solved for 64-bit Windows; see the README in that folder.
 
 Gen3 client and an NCI Data Commons API key, for downloading the CRC images.
 
