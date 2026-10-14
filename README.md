@@ -5,8 +5,6 @@
 ### Workflow  
 This repository contains the analysis code for "Are low-variance Principal Components of single-cell omics data biologically meaningful, or just noise?" with instructions for retrieving the public data sets it uses.
 
-
-```
 └── Low-variance_Principal_Components_of_single-cell_omics_data/
     ├── README.md
     ├── CRC/
@@ -40,12 +38,12 @@ This repository contains the analysis code for "Are low-variance Principal Compo
 
 #####  **CyCIF tonsil dataset** 
 Lin et al., 2018  
-Paper source : https://elifesciences.org/articles/31657#content  
+Paper source: https://elifesciences.org/articles/31657#content  
 
 Single Cell Data: [elife-31657-fig6-data1-v3.zip](https://elifesciences.org/download/aHR0cHM6Ly9jZG4uZWxpZmVzY2llbmNlcy5vcmcvYXJ0aWNsZXMvMzE2NTcvZWxpZmUtMzE2NTctZmlnNi1kYXRhMS12My56aXA-/elife-31657-fig6-data1-v3.zip?_hash=KqaC6E4lyB8cBihZ1quzv%2FgyoFJXnlDlhLEKvo1UijU%3D) 
 
-Tonsil Image data: [TonsilA](https://omero.hms.harvard.edu/pathviewer/viewer/#?slide=514684&q_dataset=3174&tabs=SD&cgs=3509&x=4448&y=4256&t=0&z=0&zoom=3.482&rotate=0)  [TonsilB](https://omero.hms.harvard.edu/pathviewer/viewer/#?slide=514687&q_dataset=3175&tabs=SD&cgs=3619&x=4448&y=4256&t=0&z=0&zoom=3.482&rotate=0)  
-Unzip and place dataTONSILA.csv and dataTONSILB.csv in Tonsil/Data/. Export each image from the viewer as TIFF and save it in the same folder as TONSILA.ome.tif.tif / TONSILB.ome.tif  
+Tonsil Image data: [TonsilA](https://omero.hms.harvard.edu/webclient/?show=image-514684|dataset-3174)  [TonsilB](https://omero.hms.harvard.edu/webclient/?show=image-514687|dataset-3175)  
+Unzip and place dataTONSILA.csv and dataTONSILB.csv in Tonsil/Data/. Export each image from the viewer as TIFF and save them in Tonsil/Data/ as TONSILA.ome.tif.tif and TONSILB.ome.tif
 
 ##### **seqFISH mouse hippocampus**   
 Shah et al., 2016  
@@ -59,22 +57,22 @@ place mmc6.xlsx in seqFISH/Data/
 Kuett et al., 2022  
 Paper source : https://www.nature.com/articles/s43018-021-00301-w  
 
-Single Cell Data : [MainHer2BreastCancerModel.zip](https://zenodo.org/records/4752030)  
+Single Cell Data: Version v3 [MainHer2BreastCancerModel.zip](https://zenodo.org/records/5782846)  
 
-unzip and place the mask and model201710_mean_intensities.csv in IMC/Data/  
+unzip and place full_mask_final_segmentation_hwatershed_500.00_90%.tif and model201710_mean_intensities.csv in IMC/Data/  
 
 ##### **CRC sections**  
 Lin et al., 2023  
 Paper source : https://www.cell.com/cell/fulltext/S0092-8674(22)01571-9  
 
 
-Download images : see 01-download-images/01_download-htan-files.md
+Download images: see download-images_01/download-htan-files_01.md
 
 Antibody panels: Table S3 [mmc3.xlsx](https://www.cell.com/cms/10.1016/j.cell.2022.12.028/attachment/2e9e88ba-5a67-4ee1-bb45-dcbb923bc7c0/mmc3.xlsx)
 
 Place mmc3.xlsx in CRC/Data/ 
 
-Cell data : BLAKE ASK SHU 
+Cell data: generated with the [t-CyCIF ImageJ/MATLAB pipeline](https://github.com/sorgerlab/cycif) described in Lin J-R, Izar B, Wang S, Yapp C, Mei S, Shah PM, et al. Highly multiplexed immunofluorescence imaging of human tissues and tumours using t-CyCIF and conventional optical microscopes. eLife. 2018;7: e31657. doi:10.7554/eLife.31657
 
 
 #### **Scripts for Analysis**
@@ -102,22 +100,27 @@ All inputs should be placed in seqFISH/Data/ and outputs will be stored in seqFI
 ##### **IMC** 
 Run in order 01 → 02. All inputs should be placed in IMC/Data/ and outputs will be stored in IMC/Data/
 
+IMC_make_csv_01.py adapts centroid and count merging logic from authors' analysis code  [BodenmillerGroup/3D_IMC_publication](https://github.com/BodenmillerGroup/3D_IMC_publication/tree/82f43d46713a461b5a1cec3e70b5bd5eb81830ca/Python/scripts/single_cell_analysis)
+
 | Script | Description | Input | Output |
 |--------|-------------|-------|--------|
-|IMC_make_csv_01.py| Creates the CSV used in IMC_pipeline_02.Rmd from downloaded data|full_mask_final_segmentation_hwatershed_500.00_90%.tif model201710_mean_intensities.csv| model201710_cells_with_positions.csv|
+|IMC_make_csv_01.py|Adds each cell’s 3D centroid (from the segmentation mask) to the authors’ per-cell intensity table. Creates the CSV used in IMC_pipeline_02.Rmd|full_mask_final_segmentation_hwatershed_500.00_90%.tif model201710_mean_intensities.csv| model201710_cells_with_positions.csv|
 |IMC_pipeline_02.Rmd| PCA on 24 markers; spatial correlation by neighbour rank within slices and between slices at every gap (300 nearest neighbours); amplitude A and length scale L from the within-slice curves; mean absolute error between within-slice and between-slice curves; figure panels.|model201710_cells_with_positions.csv|Figure 3 panels|
 
 
 
 ##### **CRC sections**
-?Run in order 01 → 04?. Scripts 01 and 02 work on the downloaded images in their own folder. For script 04, place mmc3.xlsx in CRC/Data/ and the two cell tables in CRC/Data/Raw_CRC_CSV/; figure panels are written to CRC/Data/Plots/
+Run in order 01 → 02, follow Github instructions for segmentation, then run 03. Scripts 01 and 02 work on the downloaded images in their own folder. For script 03, place mmc3.xlsx in CRC/Data/ and the two cell tables in CRC/Data/Raw_CRC_CSV/; figure panels are written to CRC/Data/Plots/
+
+Cell tables (Sardana_CRC_46.csv Sardana_CRC_47.csv) were generated with the scripts in the [t-CyCIF ImageJ/MATLAB pipeline](https://github.com/sorgerlab/cycif) repo
+
 
 |Script | Description | Input | Output |
 |--------|-------------|-------|--------|
-|01-download-images/01_download-htan-files.md|Instructions for downloading the four section images with the Gen3 client (needs an NCI Data Commons API key).| gen3_manifest.json (included) |WD-76845-044.ome.tif WD-76845-045.ome.tif WD-76845-046.ome.tif WD-76845-047.ome.tif|
-|02-align-images/02_align-sequential-shared.py|Registers the four sections onto WD-76845-044 and writes the warped channels. Python, run with pixi; see the README in that folder.| the four OME-TIFFs |one single-channel TIFF per section per channel, all on a common grid|
-|03_segmentation.Rmd | segmentation of cells from tifs|aligned tiffs|Sardana_CRC_46.csv Sardana_CRC_47.csv  |
-|04_crc_analysis.Rmd|Quality control; PCA on 24 tumor markers (section 47); mean marker intensity of the 40 nearest non-epithelial cells (section 46); CCA; permutation test; Multivariate regression; figure panels.|mmc3.xlsx, Sardana_CRC_46.csv, Sardana_CRC_47.csv| Figure 4 panels|
+|download-images_01/download-htan-files_01.md|Instructions for downloading the four section images with the Gen3 client (needs an NCI Data Commons API key).| gen3_manifest.json (included) |WD-76845-044.ome.tif WD-76845-045.ome.tif WD-76845-046.ome.tif WD-76845-047.ome.tif|
+|align-images_02/align-sequential-shared_02.py|Registers the four sections onto WD-76845-044 and writes the warped channels. Python, run with pixi; see the README in that folder.| the four OME-TIFFs |one single-channel TIFF per section per channel, all on a common grid|
+|segmentation| segmentation of cells from tifs|aligned tiffs|Sardana_CRC_46.csv Sardana_CRC_47.csv  |
+|crc_analysis_03.Rmd|Quality control; PCA on 24 tumour markers (section 47); mean marker intensity of the 40 nearest non-epithelial cells (section 46); CCA; permutation test; Multivariate regression; figure panels.|mmc3.xlsx, Sardana_CRC_46.csv, Sardana_CRC_47.csv| Figure 4 panels|
 
 #### **Requirements**
 
