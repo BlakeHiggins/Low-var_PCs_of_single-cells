@@ -2,7 +2,10 @@
 ### Paper source:  https://www.cell.com/cell/fulltext/S0092-8674(22)01571-9
 ### Inputs: WD-76845-044.ome.tif WD-76845-045.ome.tif WD-76845-046.ome.tif WD-76845-047.ome.tif
 ### outputs: one single-channel TIFF per section per channel, all on a common grid
-
+### paste(), crop_like() and dtype_convert() are copied from Ashlar (https://github.com/labsyspharm/ashlar, ashlar/utils.py),
+### Copyright (c) 2022 President and Fellows of Harvard College, MIT License.
+###The GravityRegistration setup is adapted from pirt's examples/reg_pairwise.py
+###(https://github.com/almarklein/pirt), Copyright (c) 2014 Almar Klein, BSD-3-Clause.
 # pylab
 import copy
 import pathlib
