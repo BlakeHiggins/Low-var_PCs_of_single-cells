@@ -7,7 +7,7 @@ and writes the warped channels.
 
 ```bash
 pixi install
-pixi run align-sequential-shared_02.py
+pixi run python align-sequential-shared_02.py
 ```
 
 `pixi.lock` is solved for `win-64` only. To run elsewhere, add your platform to
